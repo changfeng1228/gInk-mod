@@ -1,0 +1,17 @@
+build
+release
+bin/crash.txt
+
+*.pdb
+*.exp
+*.sdf
+*.suo
+*.opensdf
+*.lnk
+*vshost.exe*
+# --- added: dev/runtime artifacts kept out of version control ---
+bin/*.exe
+bin/*.dll
+bin/*.ini
+bin/crash.txt
+build/_scratch/
