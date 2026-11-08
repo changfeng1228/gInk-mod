@@ -34,7 +34,14 @@ namespace gInk
 			}
 		}
 
+		// A separate mutex for the development build, so a new build can be started and tested
+		// side by side with the copy that is already running. Defined only for builds compiled
+		// with -define:GINK_DEV_INSTANCE; the shipped build keeps the original id.
+#if GINK_DEV_INSTANCE
+		private static string appGuid = "86280230-c3d2-4da0-8621-e2a2466fc137";
+#else
 		private static string appGuid = "86280230-c3d2-4da0-8621-e2a2466fc136";
+#endif
 		
 		private static void UIThreadException(object sender, ThreadExceptionEventArgs t)
 		{

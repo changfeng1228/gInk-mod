@@ -64,6 +64,8 @@ namespace gInk
 		public string PinWindowTitle = "gInk pin";
 		public string PinMenuCopy = "Copy to clipboard";
 		public string PinMenuSave = "Save as...";
+		public string PinMenuZoomIn = "Enlarge";
+		public string PinMenuZoomOut = "Shrink";
 		public string PinMenuResetZoom = "Original size";
 		public string PinMenuOpacity = "Semi-transparent (75%)";
 		public string PinMenuTopMost = "Always on top";
