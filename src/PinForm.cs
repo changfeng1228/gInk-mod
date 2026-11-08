@@ -71,10 +71,11 @@ namespace gInk
 		DateTime showtime;
 
 		// corner resizing: 0 none, 1 top-left, 2 top-right, 3 bottom-left, 4 bottom-right
-		const int CornerGrab = 12;   // size of the corner hot zone, in pixels
+		const int CornerGrab = 20;   // size of the corner hot zone, in pixels
 		const float MinZoom = 0.05f;
 		const float MaxZoom = 8f;
 		const int MinEdge = 24;      // never shrink below this, or the pin cannot be grabbed again
+		const int HandleSize = 10;   // drawn corner square, kept well inside the hot zone
 		int resizingCorner = 0;
 		Rectangle resizeStartBounds;
 		float resizeStartZoom;
@@ -267,7 +268,7 @@ namespace gInk
 			using (Brush box = new SolidBrush(Color.FromArgb(210, 40, 130, 220)))
 			{
 				g.DrawRectangle(edge, 0, 0, w - 1, h - 1);
-				int n = Math.Min(6, Math.Max(2, Math.Min(w, h) / 6));
+				int n = Math.Min(HandleSize, Math.Max(3, Math.Min(w, h) / 5));
 				g.FillRectangle(box, 0, 0, n, n);
 				g.FillRectangle(box, w - n, 0, n, n);
 				g.FillRectangle(box, 0, h - n, n, n);
