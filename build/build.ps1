@@ -129,8 +129,11 @@ $output | Where-Object { $_ -notmatch 'warning CS' } | ForEach-Object { Write-Ho
 if ($LASTEXITCODE -ne 0) { Fail "compilation failed (exit $LASTEXITCODE)" }
 if (-not (Test-Path $exe)) { Fail "compiler reported success but $exe is missing" }
 
-# Run-time layout: the program loads these from its own directory, so a build is not
-# usable until they sit next to the executable.
+# Run-time layout: the program reads these from its own directory. The .ini files are
+# not in the repository (they are per-install user data written by the program), so
+# when bin\ has no copy the factory template is used instead - the program would run
+# without them anyway because SetDefaultConfig() supplies every default in code, but
+# shipping them means a fresh install has an editable copy from day one.
 Copy-Item $InkDll $outDir -Force
 foreach ($n in @('icon_red.ico', 'icon_white.ico')) {
     $p = Join-Path $root ('bin\' + $n)
@@ -138,9 +141,24 @@ foreach ($n in @('icon_red.ico', 'icon_white.ico')) {
 }
 $langDir = Join-Path $root 'bin\lang'
 if (Test-Path $langDir) { Copy-Item $langDir $outDir -Recurse -Force }
-foreach ($ini in @('config.ini', 'config_default.ini', 'pens.ini', 'hotkeys.ini')) {
-    $p = Join-Path $root ('bin\' + $ini)
-    if (Test-Path $p) { Copy-Item $p $outDir -Force }
+
+$appConfig = Join-Path $root 'bin\gInk.exe.config'
+if (Test-Path $appConfig) { Copy-Item $appConfig $outDir -Force }
+
+$defaultIni = Join-Path $root 'bin\config_default.ini'
+if (Test-Path $defaultIni) { Copy-Item $defaultIni $outDir -Force }
+
+foreach ($ini in @('config.ini', 'pens.ini', 'hotkeys.ini')) {
+    $src = Join-Path $root ('bin\' + $ini)
+    $dst = Join-Path $outDir $ini
+    if (Test-Path $src) {
+        Copy-Item $src $dst -Force
+    } elseif (-not (Test-Path $dst)) {
+        # No local copy: start the install from the factory defaults. pens.ini and
+        # hotkeys.ini have no separate template, config_default.ini documents the
+        # same defaults the code applies when a key is missing.
+        Write-Host "  note: bin\$ini absent, the program will create it on first save"
+    }
 }
 
 $size = (Get-Item $exe).Length

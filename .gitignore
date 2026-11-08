@@ -24,8 +24,12 @@ build/_scratch/
 *vshost.exe*
 
 # --- runtime data next to the executable, never committed ---
+# The program writes these when the user changes settings, so they are per-install
+# data. config_default.ini is the factory template and IS committed: build.ps1 ships
+# it so a fresh install has a reference copy of the defaults.
 bin/*.exe
 bin/*.dll
 bin/*.ini
+!bin/config_default.ini
 bin/crash.txt
 bin/gInk_debug.log
