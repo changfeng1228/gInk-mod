@@ -1,7 +1,20 @@
-build
-release
-bin/crash.txt
+# --- build output and local run data ---
+# build/res/ holds the .resources the compiler embeds; they are produced once by
+# build/extract-resources.ps1 from the upstream 1.1.1 exe and are required to compile.
+# Everything else under build/ and release/ is output or scratch.
+build/*
+!build/res/
+!build/res/*.resources
+!build/ExtractResources.cs
+!build/extract.exe
+!build/extract-resources.ps1
+!build/mk_rsp.py
+!build/verify_res.py
+!build/build.ps1
+release/
+build/_scratch/
 
+# --- IDE / symbols ---
 *.pdb
 *.exp
 *.sdf
@@ -9,9 +22,10 @@ bin/crash.txt
 *.opensdf
 *.lnk
 *vshost.exe*
-# --- added: dev/runtime artifacts kept out of version control ---
+
+# --- runtime data next to the executable, never committed ---
 bin/*.exe
 bin/*.dll
 bin/*.ini
 bin/crash.txt
-build/_scratch/
+bin/gInk_debug.log
