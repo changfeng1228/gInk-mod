@@ -43,7 +43,9 @@ use windows::core::w;
 use crate::gfx::composition::WindowComposition;
 use crate::gfx::device::{GfxError, GraphicsDevice, failed};
 use crate::platform::dpi::{DipPoint, DipRect, DpiMap, PhysicalPoint, PhysicalRect};
-use crate::platform::window::{CallbackCounts, MonotonicClock, NativeWindow};
+use crate::platform::window::{
+    CallbackCounts, MonotonicClock, NativeWindow, ensure_process_dpi_awareness,
+};
 use crate::settings::{MAX_PEN_COUNT, Settings};
 use crate::ui::animation::{SlidePlan, ToolbarAnimator};
 use crate::ui::icons::{Canvas, draw_icon, icon_for};
@@ -623,6 +625,9 @@ impl ToolbarWindow {
         settings: &Settings,
         panel_origin: Option<PhysicalPoint>,
     ) -> Result<Self, GfxError> {
+        // `monitor_geometry` below runs before the window exists; physical
+        // pixels (and the default position) require awareness first.
+        ensure_process_dpi_awareness()?;
         let model = ToolbarModel::from_settings(settings);
         let provisional_origin = panel_origin.unwrap_or(PhysicalPoint::new(
             settings.toolbar_left,

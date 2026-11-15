@@ -2,7 +2,7 @@
 
 **任务：** Task 7（Pointer 输入与可书写 MVP）  
 **日期：** 2026-11-16  
-**机器：** Windows 11 Home China 10.0.26200 x86_64；AMD Radeon 集成显卡 + NVIDIA GeForce RTX 4070 Laptop（D3D11 默认适配器为集成显卡，显存与系统内存共享）；逻辑分辨率 1707×1067、150% DPI、240Hz、单显示器。  
+**机器：** Windows 11 Home China 10.0.26200 x86_64；AMD Radeon 集成显卡 + NVIDIA GeForce RTX 4070 Laptop（D3D11 默认适配器为集成显卡，显存与系统内存共享）；物理分辨率 2560×1600、150% DPI（逻辑 1707×1067）、240Hz、单显示器。  
 **状态：** 鼠标路径已实测通过；压感笔与触摸**未验证**（本机无相应硬件）。本文件不声称笔/触摸已验收。
 
 ## 1. 结论摘要
@@ -21,8 +21,11 @@
 
 ```text
 cargo test --manifest-path plnk/Cargo.toml --test ui_ink -- --ignored --test-threads=1
+cargo test --manifest-path plnk/Cargo.toml --test ui_ink overlay_covers_true_physical_monitor_and_accepts_input_at_edges -- --ignored --test-threads=1
 cargo test --release --manifest-path plnk/Cargo.toml --test ui_ink -- --ignored --test-threads=1 ink_mvp_probe --nocapture
 ```
+
+（第二行的过滤运行让 DPI 回归测试在**全新的测试进程**中执行，复现缺陷的启动时序；整套运行时该测试同样通过。）
 
 2026-11-16 实际结果：
 
@@ -34,6 +37,7 @@ cargo test --release --manifest-path plnk/Cargo.toml --test ui_ink -- --ignored 
 | `pointer_timestamp_to_submit_is_monotonic` | PASS（桌面） | 12 帧 × 3 个合并样本：输入时间戳非递减、提交时间非递减、输入不晚于提交 |
 | `mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits` | PASS（桌面） | 真实路由鼠标输入绘制红/蓝两笔；真实点击工具栏 Pen 2 / Undo / Clear；屏幕像素逐一验证；退出后画布清空、窗口销毁 |
 | `renderer_caps_dots_and_highlighter_blend_are_visible` | PASS（桌面） | 屏幕像素确认：线段两端为**圆帽**（端点半宽内着色、半宽外不着色）、单击为**圆点**、半透明荧光笔交叉**重叠变深**（缓存增量合成正确） |
+| `overlay_covers_true_physical_monitor_and_accepts_input_at_edges` | PASS（桌面，fix round 1 回归） | 在**新进程**中 `current_monitor_rect()` 先建立 PMv2 再查询：rcMonitor 等于 DEVMODE 物理像素 2560×1600（不再是 DPI 虚拟化的 1707×1067）；覆盖层窗口矩形等于该物理矩形；在物理屏幕右下边缘注入真实鼠标输入能落到覆盖层并形成笔画，边缘像素回读可见墨迹 |
 | `mvp_real_app_launch_draws_and_exits_cleanly` | PASS（桌面） | 启动真实 `plnk.exe --no-hotkeys --draw`：覆盖层出现、真实鼠标书写可见、`WM_CLOSE` 干净退出（退出码 0，日志含 `mode Tray -> Drawing` 与 `shutdown complete`） |
 | `ink_mvp_probe` | PASS（Release 专用） | 见第 4 节；debug 构建会跳过（spec §4.2 只接受 Release 探针） |
 
@@ -45,26 +49,26 @@ cargo test --release --manifest-path plnk/Cargo.toml --test ui_ink -- --ignored 
 - **取消安全：** `WM_CAPTURECHANGED`、`WM_POINTERCAPTURECHANGED`、`WM_POINTERLEAVE`、第二触点、模式切换（绘图↔指针）都会 `InkController::cancel()`：活动笔画被丢弃，静态缓存不重绘该笔画，文档与历史不变。
 - **活动/静态分层：** 静态缓存位图保存已提交笔画；活动笔画单独绘制在活动层；指针移动只清除/重绘该局部脏矩形。提交时新笔画**增量**画入静态缓存（不重绘其下已有笔画），活动层同区域清除。
 - **无逐帧全屏上传：** `InkSurface::present` 只做 GPU 纹理合成（`DrawBitmap` 静态+活动缓存），报告 `uploaded_bytes = 0`；旧版 GDI 的每帧全屏位图上传路径不复用。
-- **当前显示器：** 覆盖层覆盖光标所在显示器的物理像素矩形；笔迹坐标为物理像素，窗口原点在绘制时减除。
+- **当前显示器与 DPI：** 进程在任何 monitor/rect 查询前建立 per-monitor-v2 DPI 感知（`App::run_with_instance`、`current_monitor_rect`、`NativeWindow`/工具栏创建路径都调用幂等的 `ensure_process_dpi_awareness`；已由清单设成 PMv2 视为成功，其他既有感知状态报错）。覆盖层覆盖光标所在显示器的**物理像素**矩形（本机 2560×1600）；笔迹坐标为物理像素，窗口原点在绘制时减除。修复前该查询发生在感知建立之前，150% 缩放下得到 1707×1067 的虚拟化矩形，覆盖层只盖住屏幕左上 44%；fix round 1 已修复并加回归测试。
 
 ## 4. 性能与内存实测（Release，本机）
 
-`ink_mvp_probe`：1000 条混合笔画（普通红 80px、蓝 30px、500px 荧光笔 alpha 80、压感 80px；每条 200 点，共 20 万点），240Hz、表面 1707×1067。
+`ink_mvp_probe`：1000 条混合笔画（普通红 80px、蓝 30px、500px 荧光笔 alpha 80、压感 80px；每条 200 点，共 20 万点），240Hz，表面为真实物理显示器 2560×1600（fix round 1 后；此前 1707×1067 的测量是 DPI 虚拟化错误，已作废）。
 
 ```text
-[ink-probe] memory.baseline_private_bytes=1523712 device_private_bytes=56922112 surface_private_bytes=73043968
-[ink-probe] strokes=1000 points=200000 write_wall_ms=1386.8 append_ms=11.7 commit_ms=1326.6 present_ms=47.3 strokes_in_dirty_avg=134.3 max=699
-[ink-probe] memory.after_250_strokes.private_bytes=79605760
-[ink-probe] memory.after_500_strokes.private_bytes=81641472
-[ink-probe] memory.after_750_strokes.private_bytes=83910656
-[ink-probe] memory.after_1000_strokes.private_bytes=85843968
-[ink-probe] memory.private_bytes=85843968 working_set_bytes=52137984 raw_point_bytes=6400000 growth_since_surface_bytes=12800000
-[ink-probe] latency.pointer_to_submit_ms median=0.876 p95=1.824 max=2.836 samples=2000
+[ink-probe] memory.baseline_private_bytes=1515520 device_private_bytes=56795136 surface_private_bytes=91172864 surface=2560x1600 display_hz=240.0
+[ink-probe] strokes=1000 points=200000 write_wall_ms=1371.8 append_ms=10.6 commit_ms=1312.9 present_ms=47.2 strokes_in_dirty_avg=134.3 max=699
+[ink-probe] memory.after_250_strokes.private_bytes=96944128
+[ink-probe] memory.after_500_strokes.private_bytes=99291136
+[ink-probe] memory.after_750_strokes.private_bytes=101560320
+[ink-probe] memory.after_1000_strokes.private_bytes=103759872
+[ink-probe] memory.private_bytes=103759872 working_set_bytes=52162560 raw_point_bytes=6400000 growth_since_surface_bytes=12587008
+[ink-probe] latency.pointer_to_submit_ms median=0.882 p95=1.784 max=2.351 samples=2000
 ```
 
-- **Pointer 消息到提交绘制（应用侧，含 Present 等待、不含数字化仪硬件）：** 中位 **0.876 ms**、p95 **1.824 ms**（目标 ≤2/≤4 ms）。测量区间：`normalize` 合并样本 → `append` → 活动层局部重绘 → `present`。
-- **1000 条笔画后内存：** 测试进程私有 85.8 MB、工作集 52.1 MB；**书写期间增量**（表面创建后 → 1000 条笔画）12.8 MB，其中原始点 6.4 MB，随笔画数线性且无泄漏迹象（250/500/750/1000 条：79.6/81.6/83.9/85.8 MB）。
-- **注意（spec §4.2 的 50MB 目标）：** 本机 D3D11 默认适配器为共享内存的集成显卡，图形栈本身（D3D11+D2D+DComp 设备，尚未创建任何笔画）在测试进程中已占 ~56.9 MB 私有内存；表面（两张全屏缓存位图 + 双缓冲交换链）再 +16.1 MB。50 MB“书写模式私有内存（不含显存）”目标在该机器上**未能达成/无法按私有字节直接判定**，因为共享显存被计入了私有字节。该数据与原因在此记录，供 Task 13 复核（需要按显存预算 API 分离统计或在独立进程测量正式 exe）；不得用省略测量来声称达标。
+- **Pointer 消息到提交绘制（应用侧，含 Present 等待、不含数字化仪硬件）：** 中位 **0.882 ms**、p95 **1.784 ms**（目标 ≤2/≤4 ms）。测量区间：`normalize` 合并样本 → `append` → 活动层局部重绘 → `present`。（真实全屏表面下与虚拟化表面的延迟基本一致：脏区光栅化仍与文档/笔画局部相关。）
+- **1000 条笔画后内存（真实 2560×1600 表面）：** 测试进程私有 103.8 MB、工作集 52.2 MB；**书写期间增量**（表面创建后 → 1000 条笔画）12.6 MB，其中原始点 6.4 MB，随笔画数线性且无泄漏迹象（250/500/750/1000 条：96.9/99.3/101.6/103.8 MB）。
+- **注意（spec §4.2 的 50MB 目标）：** 本机 D3D11 默认适配器为共享内存的集成显卡，图形栈本身（D3D11+D2D+DComp 设备，尚未创建任何笔画）在测试进程中已占 ~56.8 MB 私有内存；真实全屏表面（两张 2560×1600 缓存位图 + 双缓冲交换链）再 +34.4 MB——修复前记录的 +16.1 MB 是虚拟化 1707×1067 表面上的错误数值。50 MB“书写模式私有内存（不含显存）”目标在该机器上**未能达成/无法按私有字节直接判定**，因为共享显存被计入了私有字节。该数据与原因在此记录，供 Task 13 复核（需要按显存预算 API 分离统计或在独立进程测量正式 exe）；不得用省略测量来声称达标。
 - **提交代价：** 单条笔画提交（含 500px 荧光笔的轮廓三角化）平均 ~1.3 ms；光标移动帧（median/p95 如上）不受文档规模影响。稀疏文档与密集文档的撤销/清空仍走 `redraw_static`，会按脏区重新三角化相交笔画，密集文档下是一次性较高代价（探针中脏区平均相交 134 条笔画），Task 8/13 可再优化；不影响书写延迟目标。
 
 ## 5. 压感笔（未验证）

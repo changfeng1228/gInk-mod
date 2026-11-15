@@ -38,7 +38,9 @@ use plnk::gfx::ink_surface::InkSurface;
 use plnk::ink::{DirtyRect, DirtyRegion, InkController, PenPoint, PenStyle, PhysicalPointF};
 use plnk::input::{PointerKind, PointerNormalizer, PointerSample};
 use plnk::platform::dpi::{PhysicalPoint, PhysicalRect};
-use plnk::platform::window::{MonotonicClock, ToolbarWindow as BackdropWindow};
+use plnk::platform::window::{
+    MonotonicClock, ToolbarWindow as BackdropWindow, current_monitor_rect,
+};
 use plnk::settings::Settings;
 use plnk::ui::toolbar::{ButtonId, ToolbarModel, ToolbarWindow};
 
@@ -771,6 +773,101 @@ fn renderer_caps_dots_and_highlighter_blend_are_visible() {
     );
 }
 
+#[test]
+#[ignore = "creates a real full-monitor overlay and clicks at the screen edge"]
+fn overlay_covers_true_physical_monitor_and_accepts_input_at_edges() {
+    // REGRESSION (fix round 1): `current_monitor_rect` must establish DPI
+    // awareness before it queries the monitor. In an unaware process a scaled
+    // display reports its virtualized logical size (1707x1067 instead of
+    // 2560x1600 here), so the "full-screen" overlay missed the right/bottom
+    // part of the screen. DEVMODE's physical pixel size is the independent
+    // oracle. Run this test filtered in a fresh process to exercise start-up.
+    let physical = current_monitor_rect().expect("physical monitor rect");
+    let (panel_width, panel_height) = display_settings_pels();
+    assert_eq!(
+        (physical.width(), physical.height()),
+        (panel_width, panel_height),
+        "the monitor rect must equal the panel's true physical pixels (DPI awareness regression)"
+    );
+
+    let device = GraphicsDevice::new().expect("create graphics device");
+    // White backdrop near the physical bottom-right corner, created before the
+    // overlay so the overlay sits above it.
+    let corner = PhysicalRect::from_xywh(physical.right - 440, physical.bottom - 340, 420, 300);
+    let mut backdrop = BackdropWindow::new(&device, corner).expect("corner backdrop window");
+    backdrop
+        .fill(Rgba8::new(255, 255, 255, 255))
+        .expect("backdrop fill");
+    backdrop.show();
+    pump_for(Duration::from_millis(150));
+
+    let mut session = InkSession::new(&device, physical).expect("full-monitor ink session");
+    session.surface_mut().expect("ink surface").show();
+    pump_for(Duration::from_millis(250));
+    assert_eq!(
+        session
+            .surface()
+            .expect("ink surface")
+            .window_rect()
+            .expect("overlay window rect"),
+        physical,
+        "the overlay window must cover the true physical monitor rect"
+    );
+
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(10, 10, 10, 255), 24.0));
+    let original_cursor = cursor_position();
+    let start = PhysicalPoint::new(physical.right - 380, physical.bottom - 260);
+    move_cursor(start);
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    for step in 1..=8 {
+        move_cursor(PhysicalPoint::new(start.x + step * 32, start.y + step * 10));
+        pump_for(Duration::from_millis(8));
+    }
+    mouse_button(false);
+    pump_for(Duration::from_millis(200));
+
+    assert_eq!(
+        session.controller().document().len(),
+        1,
+        "routed real input at the physical right/bottom edge must reach the overlay"
+    );
+    let stroke = session
+        .controller()
+        .document()
+        .strokes()
+        .last()
+        .expect("edge stroke");
+    assert!(
+        stroke
+            .points()
+            .iter()
+            .any(|point| point.position.x > (physical.right - 160) as f32),
+        "the routed stroke must reach the right edge region"
+    );
+    assert!(
+        stroke
+            .points()
+            .iter()
+            .any(|point| point.position.y > (physical.bottom - 220) as f32),
+        "the routed stroke must reach the bottom edge region"
+    );
+
+    let screen = ScreenRegion::new(corner);
+    screen.refresh();
+    let ink_pixels = screen.count_matching(corner, |[r, g, b]| r < 200 && g < 200 && b < 200);
+    assert!(
+        ink_pixels > 100,
+        "ink must render at the physical right/bottom edge (non-white pixels: {ink_pixels})"
+    );
+
+    session.surface_mut().expect("ink surface").hide();
+    drop(session);
+    drop(backdrop);
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(80));
+}
+
 // ---------------------------------------------------------------------------
 // Step 4: performance probe (Release, #[ignore])
 // ---------------------------------------------------------------------------
@@ -788,7 +885,16 @@ fn ink_mvp_probe() {
     let baseline_memory = memory_snapshot();
     let device = GraphicsDevice::new().expect("create graphics device");
     let device_memory = memory_snapshot();
-    let bounds = primary_monitor_rect();
+    // `current_monitor_rect` establishes per-monitor-v2 awareness itself; the
+    // panel's physical size from DEVMODE is the independent oracle for the
+    // regression that the overlay must cover the true physical screen.
+    let bounds = current_monitor_rect().expect("physical monitor rect");
+    let (panel_width, panel_height) = display_settings_pels();
+    assert_eq!(
+        (bounds.width(), bounds.height()),
+        (panel_width, panel_height),
+        "the probe surface must be the true physical monitor rect, not a DPI-virtualized one"
+    );
     let mut surface = InkSurface::new(&device, bounds).expect("monitor-sized ink surface");
     surface.show();
     pump_for(Duration::from_millis(250));
@@ -1094,26 +1200,16 @@ fn display_refresh_hz() -> f64 {
     }
 }
 
-fn primary_monitor_rect() -> PhysicalRect {
-    let mut info = windows::Win32::Graphics::Gdi::MONITORINFO {
-        cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+/// The panel's physical pixel size from the display driver. DEVMODE is not
+/// DPI-virtualized, so it is the independent oracle for the true monitor rect.
+fn display_settings_pels() -> (i32, i32) {
+    let mut devmode = DEVMODEW {
+        dmSize: std::mem::size_of::<DEVMODEW>() as u16,
         ..Default::default()
     };
-    let monitor = unsafe {
-        windows::Win32::Graphics::Gdi::MonitorFromPoint(
-            POINT::default(),
-            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
-        )
-    };
-    unsafe {
-        let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info);
-    }
-    PhysicalRect::new(
-        info.rcMonitor.left,
-        info.rcMonitor.top,
-        info.rcMonitor.right,
-        info.rcMonitor.bottom,
-    )
+    let ok = unsafe { EnumDisplaySettingsW(PCWSTR::null(), ENUM_CURRENT_SETTINGS, &mut devmode) };
+    assert!(ok.as_bool(), "EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)");
+    (devmode.dmPelsWidth as i32, devmode.dmPelsHeight as i32)
 }
 
 #[derive(Clone, Copy)]

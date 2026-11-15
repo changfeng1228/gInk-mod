@@ -52,7 +52,7 @@ use crate::ink::geometry::PhysicalPointF;
 use crate::ink::model::{Edit, PenStyle};
 use crate::input::{MouseNormalizer, PointerKind, PointerNormalizer};
 use crate::platform::dpi::PhysicalRect;
-use crate::platform::window::{MonotonicClock, current_monitor_rect};
+use crate::platform::window::{MonotonicClock, current_monitor_rect, ensure_process_dpi_awareness};
 use crate::settings::{PenSettings, Settings};
 use crate::settings_store::StorageRoots;
 use crate::telemetry::{LogError, LogSink};
@@ -308,6 +308,14 @@ impl App {
         instance: InstanceGuard,
     ) -> Result<(), AppError> {
         let _instance = instance;
+
+        // Physical-pixel coordinates everywhere (windows, overlay bounds, ink,
+        // screenshot) require per-monitor-v2 awareness before the first
+        // monitor/rect query; an unaware process gets virtualized rectangles.
+        ensure_process_dpi_awareness().map_err(|source| AppError::Graphics {
+            context: "enabling per-monitor-v2 DPI awareness",
+            source,
+        })?;
 
         let storage_root = StorageRoots::from_environment()
             .resolve()

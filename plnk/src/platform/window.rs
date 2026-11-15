@@ -502,9 +502,13 @@ impl Drop for NativeWindow {
 
 /// Physical bounds of the monitor that currently contains the mouse cursor.
 ///
-/// The first release targets the current monitor only (spec §2/§4); a
-/// multi-monitor virtual-screen overlay remains 未验证.
+/// Establishes per-monitor-v2 DPI awareness first: an unaware process gets
+/// *virtualized* monitor rectangles (147% smaller at 150% scaling), which would
+/// leave the ink overlay covering only part of the physical screen. The first
+/// release targets the current monitor only (spec §2/§4); a multi-monitor
+/// virtual-screen overlay remains 未验证.
 pub fn current_monitor_rect() -> Result<PhysicalRect, GfxError> {
+    ensure_process_dpi_awareness()?;
     let mut point = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut point);
@@ -528,7 +532,17 @@ pub fn current_monitor_rect() -> Result<PhysicalRect, GfxError> {
     }
 }
 
-fn ensure_process_dpi_awareness() -> Result<(), GfxError> {
+/// Establishes per-monitor-v2 DPI awareness for the process.
+///
+/// Must run before the first monitor/rect query (and before any window that
+/// presents physical-pixel content). `SetProcessDpiAwarenessContext` requires
+/// Windows 10 1607+; the verified target is Windows 11 x86_64 (Windows 10 is
+/// not claimed as verified). The call is idempotent: the first result is cached
+/// and an awareness context that is already per-monitor-v2 is treated as
+/// success (for example when a manifest or an embedder set it earlier). Any
+/// other pre-existing awareness is reported as an error, because physical-pixel
+/// coordinates could not be guaranteed.
+pub fn ensure_process_dpi_awareness() -> Result<(), GfxError> {
     static STATE: OnceLock<Result<(), HRESULT>> = OnceLock::new();
     let result = STATE.get_or_init(|| {
         match unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) } {

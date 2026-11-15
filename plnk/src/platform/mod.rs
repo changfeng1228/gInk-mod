@@ -7,4 +7,5 @@ pub mod window;
 pub use dpi::{DipPoint, DipRect, DpiMap, PhysicalPoint, PhysicalRect};
 pub use window::{
     CallbackCounts, MonotonicClock, OverlayWindow, ToolbarWindow, current_monitor_rect,
+    ensure_process_dpi_awareness,
 };
