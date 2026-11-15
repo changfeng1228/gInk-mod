@@ -173,13 +173,11 @@ impl LogState {
         line.push('\n');
         let line_bytes = line.len() as u64;
 
-        if self.written > 0
-            && self.written + line_bytes > self.policy.max_file_bytes
-            && self.rotate().is_err()
-        {
-            // Keep writing to the current file if rotation failed; a full disk
-            // is reported by the caller's own error path, not by panicking.
-            return;
+        if self.written > 0 && self.written + line_bytes > self.policy.max_file_bytes {
+            // If rotation fails (for example a rolled log file is locked by
+            // another process), keep appending to the existing file instead of
+            // going silent. The size bound is best-effort on an IO error.
+            let _ = self.rotate();
         }
         if let Some(file) = self.file.as_mut()
             && file.write_all(line.as_bytes()).is_ok()
@@ -190,15 +188,37 @@ impl LogState {
 
     fn rotate(&mut self) -> io::Result<()> {
         self.file = None;
-        rotate_files(&self.path, self.policy.max_files)?;
-        self.file = Some(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?,
-        );
-        self.written = 0;
-        Ok(())
+        let result = rotate_files(&self.path, self.policy.max_files).and_then(|()| {
+            self.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+            self.written = 0;
+            Ok(())
+        });
+        if result.is_err() {
+            // Reopen the existing log so later lines are not dropped. Appending
+            // past the configured bound is preferable to losing all diagnostics
+            // for the rest of the run.
+            self.reopen_after_failed_rotation();
+        }
+        result
+    }
+
+    fn reopen_after_failed_rotation(&mut self) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => {
+                self.written = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+                self.file = Some(file);
+            }
+            Err(_) => self.file = None,
+        }
     }
 }
 

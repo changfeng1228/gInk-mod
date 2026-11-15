@@ -242,16 +242,30 @@ impl App {
         Self::run_with(settings, RunOptions::default())
     }
 
-    /// Runs with development options; `main` uses this for `--no-hotkeys` and
-    /// the desktop smoke exit hook.
+    /// Runs with development options. Acquires the singleton guard itself,
+    /// which is fine for embedders; `main` uses [`Self::run_with_instance`] so
+    /// the guard is acquired before the settings import does any filesystem
+    /// work.
     pub fn run_with(settings: Settings, options: RunOptions) -> Result<(), AppError> {
         let instance = InstanceGuard::acquire(INSTANCE_MUTEX_NAME).map_err(AppError::Instance)?;
-        let Some(_instance) = instance else {
+        let Some(instance) = instance else {
             // Legacy behaviour: a second copy exits silently and never touches
             // the first instance's tray icon, hotkeys or log.
             eprintln!("plnk: another instance is already running");
             return Ok(());
         };
+        Self::run_with_instance(settings, options, instance)
+    }
+
+    /// Runs with an already acquired singleton guard, which must stay alive for
+    /// the whole process. This lets `main` enforce single-instance before it
+    /// reads or imports any settings file.
+    pub fn run_with_instance(
+        settings: Settings,
+        options: RunOptions,
+        instance: InstanceGuard,
+    ) -> Result<(), AppError> {
+        let _instance = instance;
 
         let storage_root = StorageRoots::from_environment()
             .resolve()
@@ -283,7 +297,10 @@ impl App {
         let hwnd = window.hwnd();
         shell.window = Some(window);
         shell.start_services(hwnd)?;
-        shell.message_loop()
+        // Free function: no `&mut Shell` may be live while the pump dispatches
+        // messages, because a nested modal loop (tray menu) can re-enter the
+        // window procedure and borrow the shell again.
+        pump_messages()
     }
 }
 
@@ -704,23 +721,6 @@ impl Shell {
         }
     }
 
-    fn message_loop(&mut self) -> Result<(), AppError> {
-        let mut message = MSG::default();
-        loop {
-            let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
-            if result.0 == 0 {
-                return Ok(());
-            }
-            if result.0 == -1 {
-                return Err(AppError::MessageLoop(WindowsError::from_thread()));
-            }
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
-    }
-
     fn on_hotkey(&mut self, id: i32) {
         let Some(command) = self
             .hotkeys
@@ -731,29 +731,6 @@ impl Shell {
             return;
         };
         self.handle_command(command);
-    }
-
-    fn on_tray_event(&mut self, event: u32) {
-        match event & 0xFFFF {
-            WM_LBUTTONUP => self.handle_command(Command::ToggleInk),
-            WM_RBUTTONUP | WM_CONTEXTMENU => {
-                // TrackPopupMenu runs its own message loop; a second tray click
-                // delivered inside it must not open a nested menu.
-                if self.menu_open {
-                    return;
-                }
-                self.menu_open = true;
-                let result = match &self.tray {
-                    Some(tray) => tray.show_context_menu(),
-                    None => Ok(()),
-                };
-                self.menu_open = false;
-                if let Err(error) = result {
-                    self.log.warn(&format!("{error}"));
-                }
-            }
-            _ => {}
-        }
     }
 
     fn on_io_result(&mut self, id: u64) {
@@ -783,11 +760,12 @@ impl Shell {
     }
 
     fn request_exit(&mut self, reason: &str) {
-        if self.exit_requested {
-            return;
+        if !self.exit_requested {
+            self.exit_requested = true;
+            self.log.info(&format!("exit requested: {reason}"));
         }
-        self.exit_requested = true;
-        self.log.info(&format!("exit requested: {reason}"));
+        // Post unconditionally: a nested modal loop (the tray menu) can consume
+        // an earlier WM_QUIT, so a repeated request must still reach the pump.
         unsafe { PostQuitMessage(0) };
     }
 
@@ -842,45 +820,42 @@ unsafe extern "system" fn shell_window_proc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
         }
     }
-    let shell = unsafe { shell_from(hwnd) };
     match message {
         WM_HOTKEY => {
-            if let Some(shell) = shell {
-                shell.on_hotkey(wparam.0 as i32);
+            unsafe {
+                with_shell(hwnd, |shell| shell.on_hotkey(wparam.0 as i32));
             }
             LRESULT(0)
         }
         TRAY_CALLBACK_MESSAGE => {
-            if let Some(shell) = shell {
-                shell.on_tray_event(lparam.0 as u32);
-            }
+            unsafe { handle_tray_event(hwnd, lparam.0 as u32) };
             LRESULT(0)
         }
         IO_RESULT_MESSAGE => {
-            if let Some(shell) = shell {
-                shell.on_io_result(wparam.0 as u64);
+            unsafe {
+                with_shell(hwnd, |shell| shell.on_io_result(wparam.0 as u64));
             }
             LRESULT(0)
         }
         WM_COMMAND => {
-            if let Some(shell) = shell
-                && (wparam.0 & 0xFFFF) == MENU_EXIT
-            {
-                shell.request_exit("tray menu Exit");
+            if (wparam.0 & 0xFFFF) == MENU_EXIT {
+                unsafe {
+                    with_shell(hwnd, |shell| shell.request_exit("tray menu Exit"));
+                }
             }
             LRESULT(0)
         }
         WM_CLOSE => {
-            if let Some(shell) = shell {
-                shell.request_exit("window close message");
+            unsafe {
+                with_shell(hwnd, |shell| shell.request_exit("window close message"));
             }
             LRESULT(0)
         }
         WM_TIMER => {
-            if let Some(shell) = shell
-                && wparam.0 == EXIT_TIMER_ID
-            {
-                shell.request_exit("development exit timer");
+            if wparam.0 == EXIT_TIMER_ID {
+                unsafe {
+                    with_shell(hwnd, |shell| shell.request_exit("development exit timer"));
+                }
             }
             LRESULT(0)
         }
@@ -892,11 +867,77 @@ unsafe extern "system" fn shell_window_proc(
     }
 }
 
+/// Runs the UI message pump. A free function so no `&mut Shell` is alive while
+/// `DispatchMessageW` runs the window procedure.
+fn pump_messages() -> Result<(), AppError> {
+    let mut message = MSG::default();
+    loop {
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
+        if result.0 == 0 {
+            return Ok(());
+        }
+        if result.0 == -1 {
+            return Err(AppError::MessageLoop(WindowsError::from_thread()));
+        }
+        unsafe {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+/// Calls `action` with a short-lived mutable reference to the shell. The borrow
+/// ends before this function returns, so a handler that pumps messages (the
+/// tray menu) cannot alias a second borrow created by re-entrant dispatch.
+///
 /// # Safety
-/// `hwnd` is only dereferenced when it was created by `ShellWindow::create`,
-/// whose lifetime guarantees the pointer stays valid within that window's
-/// lifetime; `ShellWindow::destroy` clears the pointer before destruction.
-unsafe fn shell_from(hwnd: HWND) -> Option<&'static mut Shell> {
+/// `hwnd` must be the live shell window created by `ShellWindow::create`;
+/// `action` must not dispatch messages or retain the reference.
+unsafe fn with_shell(hwnd: HWND, action: impl FnOnce(&mut Shell)) {
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Shell;
-    unsafe { pointer.as_mut() }
+    if let Some(shell) = unsafe { pointer.as_mut() } {
+        action(shell);
+    }
+}
+
+/// # Safety
+/// `hwnd` must be the live shell window.
+unsafe fn handle_tray_event(hwnd: HWND, event: u32) {
+    match event & 0xFFFF {
+        WM_LBUTTONUP => unsafe {
+            with_shell(hwnd, |shell| shell.handle_command(Command::ToggleInk));
+        },
+        WM_RBUTTONUP | WM_CONTEXTMENU => unsafe { show_tray_menu(hwnd) },
+        _ => {}
+    }
+}
+
+/// Displays the real popup menu. No shell reference is alive across
+/// `TrackPopupMenu`: the menu's nested modal loop re-enters the window
+/// procedure (for example for the Exit `WM_COMMAND`), which must be free to
+/// borrow the shell itself.
+///
+/// # Safety
+/// `hwnd` must be the live shell window.
+unsafe fn show_tray_menu(hwnd: HWND) {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Shell;
+    if pointer.is_null() {
+        return;
+    }
+    if unsafe { (*pointer).menu_open } {
+        return;
+    }
+    unsafe { (*pointer).menu_open = true };
+    let result = TrayIcon::show_context_menu(hwnd);
+    unsafe {
+        (*pointer).menu_open = false;
+        if let Err(error) = result {
+            (*pointer).log.warn(&format!("{error}"));
+        }
+        // The menu's modal loop may have consumed the WM_QUIT posted by the
+        // Exit command; post it again now that control is back in the pump.
+        if (*pointer).exit_requested {
+            PostQuitMessage(0);
+        }
+    }
 }

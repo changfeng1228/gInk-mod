@@ -356,6 +356,45 @@ fn log_files(directory: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
     files
 }
 
+/// A failed rotation must not silence logging: the sink reopens the existing
+/// file and keeps appending (over the configured bound) until the IO problem
+/// is gone.
+#[test]
+fn log_rotation_failure_keeps_writing() {
+    let directory = std::env::temp_dir().join(format!(
+        "plnk-log-failure-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    std::fs::create_dir_all(&directory).expect("create the log test directory");
+    let path = directory.join("plnk.log");
+    // Make the first rolled name a directory so `remove_file` cannot remove it
+    // and every rotation attempt fails deterministically.
+    std::fs::create_dir_all(directory.join("plnk.1.log"))
+        .expect("create the rotation blocker directory");
+    let log = LogSink::with_policy(
+        path.clone(),
+        LogPolicy {
+            max_file_bytes: 128,
+            max_files: 2,
+        },
+    )
+    .expect("open the bounded log");
+
+    for index in 0..8 {
+        log.info(&format!("line {index} {}", "x".repeat(40)));
+    }
+    log.info("marker-after-failed-rotation");
+    drop(log);
+
+    let current = std::fs::read_to_string(&path).expect("read the current log file");
+    assert!(
+        current.contains("marker-after-failed-rotation"),
+        "a failed rotation must not drop later log lines: {current:?}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
 /// The mode must be one explicit state that later drawing/pointer/snapping
 /// tasks extend; transitions are testable without any window.
 #[test]

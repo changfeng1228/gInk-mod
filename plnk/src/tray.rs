@@ -87,19 +87,23 @@ impl TrayIcon {
         Ok(icon)
     }
 
-    /// Shows the tray context menu and lets Windows post the selected command
-    /// to the shell window as `WM_COMMAND`.
-    pub fn show_context_menu(&self) -> Result<(), TrayError> {
+    /// Shows the tray context menu for `hwnd` and lets Windows post the
+    /// selected command back to it as `WM_COMMAND`.
+    ///
+    /// An associated function without `self`: `TrackPopupMenu` runs a nested
+    /// modal message loop, so the caller must not hold a borrow of the shell
+    /// state (which owns this icon) while the menu is open.
+    pub fn show_context_menu(hwnd: HWND) -> Result<(), TrayError> {
         let menu = unsafe { CreatePopupMenu() }.map_err(|error| TrayError {
             context: "creating the tray menu (CreatePopupMenu)",
             source: error,
         })?;
-        let result = self.run_context_menu(menu);
+        let result = Self::run_context_menu(hwnd, menu);
         let _ = unsafe { DestroyMenu(menu) };
         result
     }
 
-    fn run_context_menu(&self, menu: HMENU) -> Result<(), TrayError> {
+    fn run_context_menu(hwnd: HWND, menu: HMENU) -> Result<(), TrayError> {
         unsafe { AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit")) }.map_err(|error| {
             TrayError {
                 context: "adding Exit to the tray menu (AppendMenuW)",
@@ -113,24 +117,15 @@ impl TrayIcon {
         })?;
         // Required so the popup closes when the user clicks elsewhere; a
         // background process is allowed to fail this call, so it is ignored.
-        let _ = unsafe { SetForegroundWindow(self.hwnd) };
-        let shown = unsafe {
-            TrackPopupMenu(
-                menu,
-                TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                Some(0),
-                self.hwnd,
-                None,
-            )
-        };
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+        let shown =
+            unsafe { TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, Some(0), hwnd, None) };
         if !shown.as_bool() {
             return Err(TrayError::from_thread(
                 "showing the tray menu (TrackPopupMenu)",
             ));
         }
-        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
         Ok(())
     }
 
