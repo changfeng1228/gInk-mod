@@ -1359,3 +1359,181 @@ impl Drop for ScreenRegion {
         }
     }
 }
+
+#[test]
+#[ignore = "launches the real app and clicks toolbar buttons with routed OS input"]
+fn real_app_toolbar_buttons_work_after_drawing() {
+    let exe = env!("CARGO_BIN_EXE_plnk");
+    let log_path = app_log_path(exe);
+    let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+    let mut child = Command::new(exe)
+        .args(["--no-hotkeys", "--draw", "--exit-after-ms", "30000"])
+        .spawn()
+        .expect("spawn plnk.exe");
+    let overlay = wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk overlay"),
+        Duration::from_secs(10),
+    )
+    .expect("overlay");
+    let toolbar = wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk toolbar"),
+        Duration::from_secs(10),
+    )
+    .expect("toolbar");
+    pump_for(Duration::from_millis(600));
+
+    // Draw first: clicking the overlay must not make its topmost band cover the
+    // toolbar (the user-facing failure this regression guards).
+    move_cursor(PhysicalPoint::new(320, 400));
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    for step in 1..=20 {
+        move_cursor(PhysicalPoint::new(320 + step * 20, 400 + step * 3));
+        pump_for(Duration::from_millis(8));
+    }
+    mouse_button(false);
+    pump_for(Duration::from_millis(300));
+
+    for (button, evidence) in [
+        (ButtonId::Pen(2), "toolbar click: Pen(2)"),
+        (ButtonId::Undo, "toolbar click: Undo"),
+        (ButtonId::Clear, "toolbar click: Clear"),
+        (ButtonId::Pointer, "toolbar click: Pointer"),
+        (ButtonId::Exit, "leaving annotation: toolbar exit button"),
+    ] {
+        let point = real_toolbar_button_center(toolbar, button);
+        let under = unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(point) };
+        assert_eq!(
+            under, toolbar,
+            "{button:?} at ({}, {}) must be routed to the toolbar, not the overlay {overlay:?}",
+            point.x, point.y
+        );
+        move_cursor(PhysicalPoint::new(point.x, point.y));
+        pump_for(Duration::from_millis(50));
+        mouse_button(true);
+        pump_for(Duration::from_millis(30));
+        mouse_button(false);
+        assert!(
+            wait_for_log_contains(&log_path, log_start, evidence, Duration::from_secs(3)),
+            "real click on {button:?} must produce {evidence:?}; log:\n{}",
+            app_log_since(&log_path, log_start)
+        );
+        pump_for(Duration::from_millis(100));
+    }
+
+    let shell = wait_for_window(
+        w!("plnk_app_shell_window"),
+        w!("plnk"),
+        Duration::from_secs(5),
+    )
+    .expect("shell");
+    unsafe { PostMessageW(Some(shell), WM_CLOSE, WPARAM(0), LPARAM(0)) }.expect("post WM_CLOSE");
+    assert!(wait_for_exit(&mut child, Duration::from_secs(10)).success());
+}
+
+#[test]
+#[ignore = "launches the real app and sends a real Esc key"]
+fn real_app_escape_exits_annotation() {
+    let exe = env!("CARGO_BIN_EXE_plnk");
+    let log_path = app_log_path(exe);
+    let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+    let mut child = Command::new(exe)
+        .args(["--no-hotkeys", "--draw", "--exit-after-ms", "20000"])
+        .spawn()
+        .expect("spawn plnk.exe");
+    wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk overlay"),
+        Duration::from_secs(10),
+    )
+    .expect("overlay");
+    pump_for(Duration::from_millis(500));
+
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            0,
+        );
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
+            0,
+        );
+    }
+    assert!(
+        wait_for_log_contains(
+            &log_path,
+            log_start,
+            "leaving annotation: Escape",
+            Duration::from_secs(3)
+        ),
+        "a real Esc key must exit annotation; log:\n{}",
+        app_log_since(&log_path, log_start)
+    );
+
+    let shell = wait_for_window(
+        w!("plnk_app_shell_window"),
+        w!("plnk"),
+        Duration::from_secs(5),
+    )
+    .expect("shell");
+    unsafe { PostMessageW(Some(shell), WM_CLOSE, WPARAM(0), LPARAM(0)) }.expect("post WM_CLOSE");
+    assert!(wait_for_exit(&mut child, Duration::from_secs(10)).success());
+}
+
+fn app_log_path(exe: &str) -> std::path::PathBuf {
+    std::path::Path::new(exe)
+        .parent()
+        .expect("exe directory")
+        .join("data")
+        .join("plnk.log")
+}
+
+fn app_log_since(path: &std::path::Path, start: u64) -> String {
+    let Ok(bytes) = std::fs::read(path) else {
+        return String::new();
+    };
+    let start = (start as usize).min(bytes.len());
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+fn wait_for_log_contains(
+    path: &std::path::Path,
+    start: u64,
+    needle: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if app_log_since(path, start).contains(needle) {
+            return true;
+        }
+        pump_for(Duration::from_millis(50));
+    }
+    false
+}
+
+fn real_toolbar_button_center(toolbar: HWND, button: ButtonId) -> POINT {
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(toolbar, &mut rect) }
+        .expect("toolbar rect");
+    let dpi = plnk::platform::dpi::DpiMap::from_window(toolbar);
+    let model = ToolbarModel::from_settings(&Settings::defaults());
+    let layout = plnk::ui::toolbar::ToolbarLayout::new(
+        &model,
+        (rect.bottom - rect.top) as f32 / dpi.scale(),
+        false,
+    );
+    let button = layout
+        .button_rect(button)
+        .expect("button in the real toolbar layout");
+    POINT {
+        x: rect.left + ((button.left + button.right) * 0.5 * dpi.scale()) as i32,
+        y: rect.top + ((button.top + button.bottom) * 0.5 * dpi.scale()) as i32,
+    }
+}

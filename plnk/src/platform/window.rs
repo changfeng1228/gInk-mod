@@ -28,13 +28,13 @@ use windows::Win32::UI::HiDpi::{
     GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
-    GetCursorPos, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, LWA_ALPHA, RegisterClassExW,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowLongW, SetWindowPos,
-    ShowWindow, WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_HWNDPARENT,
+    GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, LWA_ALPHA,
+    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowLongW,
+    SetWindowPos, ShowWindow, WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{HRESULT, PCWSTR, w};
 
@@ -419,6 +419,23 @@ impl NativeWindow {
 
     pub(crate) fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    /// Assigns an owner to this popup (`GWLP_HWNDPARENT` is ownership, not a
+    /// child relationship, for a `WS_POPUP` window).
+    pub(crate) fn set_owner(&self, owner: HWND) -> Result<(), GfxError> {
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let previous = unsafe { SetWindowLongPtrW(self.hwnd, GWLP_HWNDPARENT, owner.0 as isize) };
+        if previous == 0 {
+            let error = unsafe { GetLastError() };
+            if error != ERROR_SUCCESS {
+                return Err(GfxError::Operation {
+                    context: "SetWindowLongPtrW(GWLP_HWNDPARENT)",
+                    source: windows::core::Error::from_hresult(HRESULT::from_win32(error.0)),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn callback_counts(&self) -> CallbackCounts {

@@ -699,6 +699,16 @@ impl ToolbarWindow {
             .unwrap_or_default()
     }
 
+    /// Makes the toolbar an owned popup of the ink overlay. Owned windows stay
+    /// above their owner in the topmost band even when a mouse-down raises the
+    /// overlay, so drawing never makes the toolbar buttons unreachable.
+    pub(crate) fn set_owner(&mut self, owner: HWND) -> Result<(), GfxError> {
+        let Some(window) = self.ui.window.as_ref() else {
+            return Ok(());
+        };
+        window.set_owner(owner)
+    }
+
     /// Replaces the displayed model and redraws immediately.
     pub fn set_model(&mut self, model: ToolbarModel) -> Result<(), GfxError> {
         self.ui.model = model;

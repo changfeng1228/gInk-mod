@@ -28,7 +28,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_ESCAPE,
+};
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
@@ -74,6 +76,10 @@ pub const IO_RESULT_MESSAGE: u32 = WM_APP + 21;
 /// Posted by the toolbar when the user clicks a button; `wparam` carries
 /// [`ButtonId::code`].
 pub const TOOLBAR_CLICK_MESSAGE: u32 = WM_APP + 22;
+
+/// Drawing-scoped Escape registration. Kept separate from the configurable
+/// global hotkeys so `--no-hotkeys` development runs still support Esc.
+const ANNOTATION_ESCAPE_HOTKEY_ID: i32 = 0x4553; // "ES"
 
 const EXIT_TIMER_ID: usize = 0x504C; // "PL"
 const IO_QUEUE_CAPACITY: usize = 8;
@@ -1132,13 +1138,14 @@ struct Shell {
     hotkeys: Option<GlobalHotkeys>,
     io: Option<IoWorker>,
     completions: Option<Arc<PostMessageCompletion>>,
-    // Drawing stack, in dependency order: the session owns the overlay window,
-    // the toolbar is a sibling window, and both use the graphics device. They
-    // are created lazily on the first drawing session and stay alive until
-    // shutdown (Task 13 owns full idle-resource reclamation).
-    ink: Option<Box<InkSession>>,
+    // Drawing stack, in dependency order: the toolbar is an owned popup of
+    // the overlay and must therefore be destroyed before its owner. Both use
+    // the graphics device. They are created lazily on the first drawing
+    // session and stay alive until shutdown.
     toolbar: Option<ToolbarUiWindow>,
+    ink: Option<Box<InkSession>>,
     gfx: Option<GraphicsDevice>,
+    annotation_escape: bool,
     settings: Settings,
     options: RunOptions,
     mode: AppMode,
@@ -1162,6 +1169,7 @@ impl Shell {
             ink: None,
             toolbar: None,
             gfx: None,
+            annotation_escape: false,
             settings,
             options,
             mode: AppMode::Tray,
@@ -1347,6 +1355,14 @@ impl Shell {
                     source,
                 }
             })?;
+            if let Some(surface) = self.ink.as_ref().and_then(|session| session.surface()) {
+                toolbar
+                    .set_owner(surface.hwnd())
+                    .map_err(|source| AppError::Graphics {
+                        context: "keeping the toolbar above the ink overlay",
+                        source,
+                    })?;
+            }
             if let Some(window) = self.window.as_ref() {
                 toolbar.set_click_notifier(window.hwnd(), TOOLBAR_CLICK_MESSAGE);
             }
@@ -1380,7 +1396,57 @@ impl Shell {
             }
             return Err(AppError::from(error));
         }
+        if let Err(error) = self.register_annotation_escape() {
+            self.exit_annotation("Escape registration failed");
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn register_annotation_escape(&mut self) -> Result<(), AppError> {
+        if self.annotation_escape {
+            return Ok(());
+        }
+        let Some(window) = self.window.as_ref() else {
+            return Err(AppError::Runtime(
+                "shell window missing while registering Escape".to_owned(),
+            ));
+        };
+        unsafe {
+            RegisterHotKey(
+                Some(window.hwnd()),
+                ANNOTATION_ESCAPE_HOTKEY_ID,
+                HOT_KEY_MODIFIERS(0),
+                u32::from(VK_ESCAPE.0),
+            )
+        }
+        .map_err(|source| AppError::Window {
+            context: "registering the annotation Escape hotkey",
+            source,
+        })?;
+        self.annotation_escape = true;
+        self.log.info("annotation Escape hotkey registered");
+        Ok(())
+    }
+
+    fn unregister_annotation_escape(&mut self) {
+        if !self.annotation_escape {
+            return;
+        }
+        self.annotation_escape = false;
+        if let Some(window) = self.window.as_ref() {
+            let result =
+                unsafe { UnregisterHotKey(Some(window.hwnd()), ANNOTATION_ESCAPE_HOTKEY_ID) };
+            if let Err(error) = result {
+                self.log
+                    .warn(&format!("could not unregister Escape: {error}"));
+            }
+        }
+        self.log.info("annotation Escape hotkey unregistered");
+    }
+
+    fn on_escape(&mut self) {
+        self.exit_annotation("Escape");
     }
 
     /// Back to tray mode: drop a live contact, clear through the history, hide
@@ -1388,6 +1454,7 @@ impl Shell {
     /// the next session (undo restoring pre-exit strokes is same-process only).
     fn exit_annotation(&mut self, reason: &str) {
         self.log.info(&format!("leaving annotation: {reason}"));
+        self.unregister_annotation_escape();
         if let Some(session) = self.ink.as_mut() {
             if let Err(error) = session.close_annotation() {
                 self.log.warn(&format!("could not clear ink: {error}"));
@@ -1543,6 +1610,13 @@ impl Shell {
             self.log
                 .info(&format!("{released} global hotkey(s) unregistered"));
         }
+        self.unregister_annotation_escape();
+        if let Some(mut toolbar) = self.toolbar.take() {
+            let _ = toolbar.fast_exit();
+            let _ = toolbar.settle_now();
+            drop(toolbar);
+            self.log.info("toolbar released");
+        }
         if let Some(mut ink) = self.ink.take() {
             if let Err(error) = ink.cancel_active() {
                 self.log
@@ -1553,12 +1627,6 @@ impl Shell {
             }
             drop(ink);
             self.log.info("ink surface released");
-        }
-        if let Some(mut toolbar) = self.toolbar.take() {
-            let _ = toolbar.fast_exit();
-            let _ = toolbar.settle_now();
-            drop(toolbar);
-            self.log.info("toolbar released");
         }
         self.gfx = None;
         if let Some(mut window) = self.window.take() {
@@ -1588,8 +1656,14 @@ unsafe extern "system" fn shell_window_proc(
     }
     match message {
         WM_HOTKEY => {
-            unsafe {
-                with_shell(hwnd, |shell| shell.on_hotkey(wparam.0 as i32));
+            if wparam.0 as i32 == ANNOTATION_ESCAPE_HOTKEY_ID {
+                unsafe {
+                    with_shell(hwnd, |shell| shell.on_escape());
+                }
+            } else {
+                unsafe {
+                    with_shell(hwnd, |shell| shell.on_hotkey(wparam.0 as i32));
+                }
             }
             LRESULT(0)
         }
