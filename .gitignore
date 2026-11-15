@@ -14,6 +14,9 @@ build/*
 release/
 build/_scratch/
 
+# --- Rust ---
+plnk/target/
+
 # --- IDE / symbols ---
 *.pdb
 *.exp

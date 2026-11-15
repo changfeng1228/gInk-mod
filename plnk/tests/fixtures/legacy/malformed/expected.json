@@ -1,0 +1,116 @@
+{
+  "missing-file": {
+    "input": "No config.ini, pens.ini or hotkeys.ini exists in the fixture directory.",
+    "expected": "Settings::defaults() (the code defaults used when the legacy files are completely absent); warnings: none; import succeeds and creates no file.",
+    "distinct_from_factory": "See default/expected.json. Pen3/Pen7 colours, Toolbar_Height, Allow_Dragging_Toolbar, Allow_Hotkey_In_Pointer_Mode and the non-global hotkeys differ on purpose.",
+    "settings": "code defaults",
+    "warnings": [],
+    "save": "only to the new plnk settings path; legacy_paths_touched: false"
+  },
+  "missing-keys": {
+    "input": "config.ini has only Language_File; pens.ini has one Pen1 group; hotkeys.ini is empty.",
+    "expected": "Present valid keys are imported; every absent key falls back to the code default. Missing keys are not warnings; only invalid values warn (P-172, spec 6.4).",
+    "settings": {
+      "language_file": "zh-cn",
+      "pen1": { "enabled": false, "rgb": [200, 10, 20], "alpha": 128, "width": 300 },
+      "other_pens": "code defaults",
+      "config_icons": "code defaults (Eraser/Pan/Pointer/InkVisible/Snapshot/Undo/Clear true, PenWidth false, CanvasCursor arrow, AllowDragging true, AllowHotkeyInPointerMode true, ToolbarHeight 0.06, CloseOnSnap blank_only)",
+      "hotkeys": "code defaults (Global Ctrl + Alt + G, SnapPin Ctrl + Alt + Shift + P, all others None)"
+    },
+    "warnings": [],
+    "save": "only to the new plnk settings path; legacy_paths_touched: false"
+  },
+  "invalid-values": {
+    "input": "Ranges, booleans, floats, Close_On_Snap and a two-digit pen id are invalid.",
+    "expected": "Each invalid value falls back for that key and appends a SettingsWarning with the key name; valid values still import.",
+    "settings": {
+      "white_tray_icon": false,
+      "white_tray_icon_note": "First set to True, then 'maybe'; legacy White_Tray_Icon sets false for every value other than True/1/ON, so the final value is false and a warning is recorded.",
+      "eraser_icon": true,
+      "pan_icon": false,
+      "pointer_icon": false,
+      "pen_width_icon": true,
+      "ink_visible_icon": false,
+      "snapshot_icon": true,
+      "undo_icon": true,
+      "clear_icon": false,
+      "canvas_cursor": "arrow",
+      "allow_dragging_toolbar": true,
+      "allow_hotkey_in_pointer_mode": true,
+      "toolbar_left": 0,
+      "toolbar_top": 0,
+      "toolbar_height": 0.06,
+      "close_on_snap": "blank_only",
+      "always_hide_toolbar": false,
+      "snapshot_path": "%USERPROFILE%/Pictures/gInk/",
+      "pen0": { "rgb": [80, 80, 80], "note": "300 and -1 are out of range" },
+      "pen1": { "rgb": [225, 60, 200], "alpha": 255, "note": "alpha 999 is out of range; blue 200 is valid" },
+      "pen2": { "width": 80, "note": "width 10 is below 30" },
+      "pen3": { "width": 80, "note": "width 5000 is above 3000" },
+      "pen10_red": "PEN10_RED is an invalid pen id (D-023); it must not change Pen1 and must warn"
+    },
+    "warnings": [
+      "White_Tray_Icon",
+      "Eraser_Icon",
+      "Snapshot_Icon",
+      "Canvas_Cursor",
+      "Allow_Dragging_Toolbar",
+      "Allow_Hotkey_In_Pointer_Mode",
+      "Toolbar_Left",
+      "Toolbar_Top",
+      "Toolbar_Height",
+      "Close_On_Snap",
+      "Always_Hide_Toolbar",
+      "Pen0_Red",
+      "Pen0_Green",
+      "Pen1_Alpha",
+      "Pen2_Width",
+      "Pen3_Width",
+      "PEN10_RED"
+    ],
+    "save": "only to the new plnk settings path; legacy_paths_touched: false"
+  },
+  "syntax": {
+    "input": "Section headers, all legacy comment prefixes, blank lines, lowercase keys with extra spaces, duplicate keys, unknown keys, and a value containing a second '='.",
+    "expected": "Section/comment lines are skipped and preserved; keys are trimmed and uppercased; the later duplicate wins; unknown lines are preserved; a line whose value contains '=' is skipped entirely.",
+    "settings": {
+      "language_file": "zh-cn",
+      "eraser_icon": false,
+      "white_tray_icon": false,
+      "toolbar_top": 42
+    },
+    "warnings": [],
+    "save": "Saving after import must preserve every comment, section header, blank and unknown line verbatim and only rewrite recognised keys; legacy_paths_touched: false."
+  },
+  "encoding": {
+    "input": "config.ini is UTF-8 with BOM, CRLF and a non-ASCII path value; pens.ini is UTF-8 without BOM and LF; hotkeys.ini is UTF-8 without BOM and CRLF.",
+    "expected": "All files parse as UTF-8; the BOM does not become part of the first key; line endings do not change semantics.",
+    "settings": {
+      "language_file": "zh-cn",
+      "snapshot_path": "%USERPROFILE%/图片/",
+      "pen2": { "alpha": 128, "width": 120 },
+      "hotkey_global": "Ctrl + Alt + G"
+    },
+    "warnings": [],
+    "save": "only to the new plnk settings path; legacy_paths_touched: false"
+  },
+  "hotkeys": {
+    "input": "None, Ctrl combos, F1-F12, NumPad names, spacing variants and two invalid values (Ctrl +, F13).",
+    "expected": "Every valid hotkey parses and round-trips through display; F10-F12 work (D-001 fixed); NumPad uses stable readable names (D-002 fixed); an invalid value rolls back the whole hotkey with a key-name warning (D-003 fixed).",
+    "settings": {
+      "global": "Ctrl + Alt + G",
+      "eraser": "F1",
+      "ink_visible": "F2",
+      "pointer": "F3",
+      "pan": "F4",
+      "undo": "F5",
+      "redo": "F6",
+      "snapshot": "F7",
+      "snap_pin": "Ctrl + Alt + Shift + P",
+      "clear": "None",
+      "pens": ["F8", "F9", "F10", "F11", "F12", "NumPad0", "NumPad5", "NumPad9", "None", "None"]
+    },
+    "warnings": ["Pen8_Hotkey", "Pen9_Hotkey"],
+    "save": "only to the new plnk settings path; legacy_paths_touched: false"
+  }
+}

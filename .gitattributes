@@ -1,0 +1,4 @@
+# Legacy gInk INI fixtures must keep their exact bytes (CRLF/LF, UTF-8 BOM)
+# because the parser tests assert line-ending and BOM behaviour. Git must not
+# normalise them on add or checkout.
+plnk/tests/fixtures/legacy/**/*.ini -text

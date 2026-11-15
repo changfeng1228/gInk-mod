@@ -1,0 +1,61 @@
+{
+  "provenance": {
+    "source": "Read-only copy of the user's running gInk 1.1.1 configuration on 2026-11-15. Only config.ini, pens.ini and hotkeys.ini were copied; lang/, icons, executables, screenshots, logs and crash data were not.",
+    "date": "2026-11-15",
+    "desensitized": "The copy contains no user name, machine name, e-mail, absolute user path, screenshot, clipboard image, crash dump or debug log. Snapshot_Path stays in the generic %USERPROFILE% form.",
+    "line_endings": "All three copied files use CRLF, as written by the legacy SaveOptions."
+  },
+  "settings": {
+    "language_file": "zh-cn",
+    "white_tray_icon": false,
+    "snapshot_path": "%USERPROFILE%/Pictures/gInk/",
+    "eraser_icon": true,
+    "pan_icon": true,
+    "pointer_icon": true,
+    "pen_width_icon": false,
+    "ink_visible_icon": true,
+    "snapshot_icon": true,
+    "undo_icon": true,
+    "clear_icon": true,
+    "canvas_cursor": "arrow",
+    "allow_dragging_toolbar": false,
+    "allow_hotkey_in_pointer_mode": false,
+    "toolbar_left": 0,
+    "toolbar_top": 0,
+    "close_on_snap": "blank_only",
+    "always_hide_toolbar": false,
+    "toolbar_height": 0.05,
+    "pens": [
+      { "enabled": false, "rgb": [80, 80, 80], "alpha": 255, "width": 80 },
+      { "enabled": true, "rgb": [225, 60, 60], "alpha": 255, "width": 80 },
+      { "enabled": true, "rgb": [30, 110, 200], "alpha": 255, "width": 80 },
+      { "enabled": true, "rgb": [235, 180, 55], "alpha": 255, "width": 80 },
+      { "enabled": true, "rgb": [120, 175, 70], "alpha": 255, "width": 80 },
+      { "enabled": true, "rgb": [235, 125, 15], "alpha": 80, "width": 500 },
+      { "enabled": false, "rgb": [230, 230, 230], "alpha": 255, "width": 80 },
+      { "enabled": false, "rgb": [240, 140, 200], "alpha": 255, "width": 80 },
+      { "enabled": false, "rgb": [25, 180, 175], "alpha": 255, "width": 80 },
+      { "enabled": false, "rgb": [145, 70, 160], "alpha": 80, "width": 500 }
+    ],
+    "hotkeys": {
+      "global": "Ctrl + Alt + Z",
+      "eraser": "E",
+      "ink_visible": "V",
+      "pointer": "None",
+      "pan": "None",
+      "undo": "Ctrl + Z",
+      "redo": "Ctrl + Y",
+      "snapshot": "Ctrl + Alt + S",
+      "snap_pin": "Ctrl + Alt + A",
+      "clear": "Ctrl + Q",
+      "pens": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    }
+  },
+  "warnings": [],
+  "pin_on_snap": "This file has no Pin_On_Snap line; legacy SaveOptions does not add missing keys (D-015). Import must not invent any Pin_On_Snap behavior.",
+  "save": {
+    "allowed": "only to the new plnk settings path; these legacy fixture files are read-only",
+    "legacy_paths_touched": false
+  },
+  "assertions_in": "plnk/tests/settings.rs::current_pen_and_hotkey_values_survive_import"
+}
