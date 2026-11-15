@@ -59,6 +59,7 @@ use crate::settings::{PenSettings, Settings};
 use crate::settings_store::StorageRoots;
 use crate::telemetry::{LogError, LogSink};
 use crate::tray::{MENU_EXIT, TrayError, TrayIcon};
+use crate::ui::pen_width::{DEFAULT_WIDTH_HIMETRIC, PenWidthPanel};
 use crate::ui::toolbar::{ButtonId, ToolbarWindow as ToolbarUiWindow};
 
 /// Singleton mutex of the new app. Deliberately different from the legacy
@@ -76,6 +77,8 @@ pub const IO_RESULT_MESSAGE: u32 = WM_APP + 21;
 /// Posted by the toolbar when the user clicks a button; `wparam` carries
 /// [`ButtonId::code`].
 pub const TOOLBAR_CLICK_MESSAGE: u32 = WM_APP + 22;
+/// Live pen-width updates posted by the popup slider (`wparam` = HIMETRIC).
+pub const PEN_WIDTH_CHANGE_MESSAGE: u32 = WM_APP + 23;
 
 /// Drawing-scoped Escape registration. Kept separate from the configurable
 /// global hotkeys so `--no-hotkeys` development runs still support Esc.
@@ -119,12 +122,14 @@ impl AppMode {
 
 /// Development options. `--no-hotkeys` keeps a test run from claiming the
 /// legacy app's combinations; `--draw` enters drawing mode without the tray or
-/// hotkey (desktop acceptance and quick previews); `--exit-after-ms` lets the
+/// hotkey; `--pen-width` forces the legacy pen-width button visible for an
+/// acceptance run without editing any config; `--exit-after-ms` lets the
 /// desktop smoke test start and stop the real shell without synthetic input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     pub no_hotkeys: bool,
     pub draw_mode: bool,
+    pub pen_width: bool,
     pub exit_after: Option<Duration>,
 }
 
@@ -141,6 +146,7 @@ impl RunOptions {
             match argument.as_str() {
                 "--no-hotkeys" => options.no_hotkeys = true,
                 "--draw" => options.draw_mode = true,
+                "--pen-width" => options.pen_width = true,
                 "--exit-after-ms" => {
                     let value = args.next().ok_or_else(|| {
                         AppError::Usage(
@@ -155,7 +161,7 @@ impl RunOptions {
                 }
                 _ => {
                     return Err(AppError::Usage(format!(
-                        "unknown argument: {argument} (supported: --no-hotkeys, --draw, --exit-after-ms <ms>)"
+                        "unknown argument: {argument} (supported: --no-hotkeys, --draw, --pen-width, --exit-after-ms <ms>)"
                     )));
                 }
             }
@@ -348,6 +354,11 @@ impl App {
         // The Shell must be boxed before the window exists: the window
         // procedure stores a raw pointer to it, and the address must never move
         // while Windows owns that pointer.
+        let mut settings = settings;
+        if options.pen_width {
+            // Development-only visibility override; never writes a config key.
+            settings.pen_width_icon = true;
+        }
         let mut shell = Box::new(Shell::new(settings, options, log));
         let window = ShellWindow::create(shell.as_ref())?;
         let hwnd = window.hwnd();
@@ -1156,6 +1167,7 @@ struct Shell {
     // the overlay and must therefore be destroyed before its owner. Both use
     // the graphics device. They are created lazily on the first drawing
     // session and stay alive until shutdown.
+    pen_width: Option<PenWidthPanel>,
     toolbar: Option<ToolbarUiWindow>,
     ink: Option<Box<InkSession>>,
     gfx: Option<GraphicsDevice>,
@@ -1164,6 +1176,7 @@ struct Shell {
     options: RunOptions,
     mode: AppMode,
     pen_index: usize,
+    global_pen_width: f32,
     log: LogSink,
     exit_requested: bool,
     menu_open: bool,
@@ -1180,6 +1193,7 @@ impl Shell {
             hotkeys: None,
             io: None,
             completions: None,
+            pen_width: None,
             ink: None,
             toolbar: None,
             gfx: None,
@@ -1188,6 +1202,7 @@ impl Shell {
             options,
             mode: AppMode::Tray,
             pen_index,
+            global_pen_width: DEFAULT_WIDTH_HIMETRIC,
             log,
             exit_requested: false,
             menu_open: false,
@@ -1331,7 +1346,7 @@ impl Shell {
             self.gfx = Some(device);
             self.log.info("graphics device created");
         }
-        if self.ink.is_some() && self.toolbar.is_some() {
+        if self.ink.is_some() && self.toolbar.is_some() && self.pen_width.is_some() {
             return Ok(());
         }
         let bounds = current_monitor_rect().map_err(|source| AppError::Graphics {
@@ -1344,16 +1359,12 @@ impl Shell {
                     "graphics device missing after initialization".to_owned(),
                 ));
             };
-            let mut session =
-                InkSession::new(device, bounds).map_err(|source| AppError::Graphics {
-                    context: "creating the ink overlay",
-                    source,
-                })?;
-            session.set_pen_style(pen_style_for_dpi(
-                &self.settings.pens[self.pen_index],
-                display_dpi(&session),
-            ));
+            let session = InkSession::new(device, bounds).map_err(|source| AppError::Graphics {
+                context: "creating the ink overlay",
+                source,
+            })?;
             self.ink = Some(session);
+            self.refresh_pen_style();
             self.log.info(&format!(
                 "ink overlay created at {}x{} physical pixels",
                 bounds.width(),
@@ -1385,6 +1396,27 @@ impl Shell {
             }
             self.toolbar = Some(toolbar);
             self.log.info("toolbar window created");
+        }
+        if self.pen_width.is_none() {
+            let Some(device) = self.gfx.as_ref() else {
+                return Err(AppError::Runtime(
+                    "graphics device missing after initialization".to_owned(),
+                ));
+            };
+            let owner = self
+                .toolbar
+                .as_ref()
+                .map_or(HWND::default(), |toolbar| toolbar.hwnd());
+            let mut panel =
+                PenWidthPanel::new(device, owner).map_err(|source| AppError::Graphics {
+                    context: "creating the pen-width popup",
+                    source,
+                })?;
+            if let Some(window) = self.window.as_ref() {
+                panel.set_change_notifier(window.hwnd(), PEN_WIDTH_CHANGE_MESSAGE);
+            }
+            self.pen_width = Some(panel);
+            self.log.info("pen-width popup created");
         }
         Ok(())
     }
@@ -1463,7 +1495,16 @@ impl Shell {
     }
 
     fn on_escape(&mut self) {
-        self.exit_annotation("Escape");
+        if self
+            .pen_width
+            .as_ref()
+            .is_some_and(|panel| panel.is_visible())
+        {
+            self.hide_pen_width_panel();
+            self.log.info("pen width panel closed by Escape");
+        } else {
+            self.exit_annotation("Escape");
+        }
     }
 
     /// Back to tray mode: drop a live contact, clear through the history, hide
@@ -1472,6 +1513,7 @@ impl Shell {
     fn exit_annotation(&mut self, reason: &str) {
         self.log.info(&format!("leaving annotation: {reason}"));
         self.unregister_annotation_escape();
+        self.hide_pen_width_panel();
         if let Some(session) = self.ink.as_mut() {
             if let Err(error) = session.close_annotation() {
                 self.log.warn(&format!("could not clear ink: {error}"));
@@ -1521,13 +1563,9 @@ impl Shell {
             self.log.warn(&format!("pen index {index} is out of range"));
             return;
         }
+        self.hide_pen_width_panel();
         self.pen_index = index;
-        if let Some(session) = self.ink.as_mut() {
-            session.set_pen_style(pen_style_for_dpi(
-                &self.settings.pens[index],
-                display_dpi(session),
-            ));
-        }
+        self.refresh_pen_style();
         if let Some(toolbar) = self.toolbar.as_mut() {
             let mut model = toolbar.model().clone();
             model.set_active(Some(ButtonId::Pen(index as u8)));
@@ -1541,6 +1579,69 @@ impl Shell {
         if self.mode == AppMode::Pointer {
             self.handle_command(Command::Pointer);
         }
+    }
+
+    fn refresh_pen_style(&mut self) {
+        let index = self.pen_index;
+        let global_width = self.global_pen_width;
+        let override_width = self.settings.pen_width_icon;
+        if let Some(session) = self.ink.as_mut() {
+            let dpi = display_dpi(session);
+            let mut style = pen_style_for_dpi(&self.settings.pens[index], dpi);
+            if override_width {
+                // Legacy PenWidthEnabled overrides every pen's width globally;
+                // color/alpha stay per-pen and the HIMETRIC value is session-only.
+                style.width = PenStyle::himetric(style.color, global_width, dpi, false).width;
+            }
+            session.set_pen_style(style);
+            self.log
+                .info(&format!("active pen width: {:.3} physical px", style.width));
+        }
+    }
+
+    fn toggle_pen_width(&mut self) {
+        if self.mode != AppMode::Drawing {
+            return;
+        }
+        if self
+            .pen_width
+            .as_ref()
+            .is_some_and(|panel| panel.is_visible())
+        {
+            self.hide_pen_width_panel();
+            return;
+        }
+        let Some(toolbar) = self.toolbar.as_ref() else {
+            return;
+        };
+        let Some(button) = toolbar.button_screen_rect(ButtonId::PenWidth) else {
+            return;
+        };
+        let toolbar_rect = toolbar.panel_rect();
+        if let Some(panel) = self.pen_width.as_mut() {
+            panel.show_above(toolbar_rect, button);
+            self.log.info("pen width panel shown");
+        }
+    }
+
+    fn hide_pen_width_panel(&mut self) {
+        if let Some(panel) = self.pen_width.as_mut()
+            && panel.is_visible()
+        {
+            panel.hide();
+        }
+    }
+
+    fn on_pen_width_change(&mut self, width: f32) {
+        if !width.is_finite() {
+            return;
+        }
+        self.global_pen_width = width.clamp(30.0, 3000.0);
+        self.refresh_pen_style();
+        self.log.info(&format!(
+            "global pen width: {:.0} HIMETRIC",
+            self.global_pen_width
+        ));
     }
 
     fn ink_undo(&mut self) {
@@ -1575,6 +1676,7 @@ impl Shell {
             ButtonId::Pen(index) => self.select_pen(usize::from(index)),
             ButtonId::Undo => self.ink_undo(),
             ButtonId::Clear => self.ink_clear(),
+            ButtonId::PenWidth => self.toggle_pen_width(),
             ButtonId::Exit => self.exit_annotation("toolbar exit button"),
             ButtonId::Pointer => self.handle_command(Command::Pointer),
             // The dock slide is handled inside the toolbar window itself.
@@ -1631,6 +1733,10 @@ impl Shell {
                 .info(&format!("{released} global hotkey(s) unregistered"));
         }
         self.unregister_annotation_escape();
+        if let Some(panel) = self.pen_width.take() {
+            drop(panel);
+            self.log.info("pen-width popup released");
+        }
         if let Some(mut toolbar) = self.toolbar.take() {
             let _ = toolbar.fast_exit();
             let _ = toolbar.settle_now();
@@ -1700,6 +1806,12 @@ unsafe extern "system" fn shell_window_proc(
         TOOLBAR_CLICK_MESSAGE => {
             unsafe {
                 with_shell(hwnd, |shell| shell.on_toolbar_click(wparam.0));
+            }
+            LRESULT(0)
+        }
+        PEN_WIDTH_CHANGE_MESSAGE => {
+            unsafe {
+                with_shell(hwnd, |shell| shell.on_pen_width_change(wparam.0 as f32));
             }
             LRESULT(0)
         }

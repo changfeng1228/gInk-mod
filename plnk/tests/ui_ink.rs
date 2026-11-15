@@ -1519,11 +1519,21 @@ fn wait_for_log_contains(
 }
 
 fn real_toolbar_button_center(toolbar: HWND, button: ButtonId) -> POINT {
+    real_toolbar_button_center_with_width(toolbar, button, false)
+}
+
+fn real_toolbar_button_center_with_width(
+    toolbar: HWND,
+    button: ButtonId,
+    pen_width: bool,
+) -> POINT {
     let mut rect = windows::Win32::Foundation::RECT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(toolbar, &mut rect) }
         .expect("toolbar rect");
     let dpi = plnk::platform::dpi::DpiMap::from_window(toolbar);
-    let model = ToolbarModel::from_settings(&Settings::defaults());
+    let mut settings = Settings::defaults();
+    settings.pen_width_icon = pen_width;
+    let model = ToolbarModel::from_settings(&settings);
     let layout = plnk::ui::toolbar::ToolbarLayout::new(
         &model,
         (rect.bottom - rect.top) as f32 / dpi.scale(),
@@ -1535,5 +1545,143 @@ fn real_toolbar_button_center(toolbar: HWND, button: ButtonId) -> POINT {
     POINT {
         x: rect.left + ((button.left + button.right) * 0.5 * dpi.scale()) as i32,
         y: rect.top + ((button.top + button.bottom) * 0.5 * dpi.scale()) as i32,
+    }
+}
+
+#[test]
+#[ignore = "uses real mouse drags on the pen-width slider and real Esc keys"]
+fn real_app_pen_width_slider_and_escape_priority_work() {
+    let exe = env!("CARGO_BIN_EXE_plnk");
+    let log_path = app_log_path(exe);
+    let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+    let mut child = Command::new(exe)
+        .args([
+            "--no-hotkeys",
+            "--draw",
+            "--pen-width",
+            "--exit-after-ms",
+            "30000",
+        ])
+        .spawn()
+        .expect("spawn plnk.exe");
+    let toolbar = wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk toolbar"),
+        Duration::from_secs(10),
+    )
+    .expect("toolbar");
+    pump_for(Duration::from_millis(600));
+
+    let button = real_toolbar_button_center_with_width(toolbar, ButtonId::PenWidth, true);
+    move_cursor(PhysicalPoint::new(button.x, button.y));
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    pump_for(Duration::from_millis(30));
+    mouse_button(false);
+    assert!(wait_for_log_contains(
+        &log_path,
+        log_start,
+        "pen width panel shown",
+        Duration::from_secs(3)
+    ));
+    let panel = wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk pen width"),
+        Duration::from_secs(3),
+    )
+    .expect("pen-width panel");
+    assert!(unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(panel) }.as_bool());
+
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(panel, &mut rect) }
+        .expect("panel rect");
+    let dpi = plnk::platform::dpi::DpiMap::from_window(panel);
+    let y = rect.top + (40.0 * dpi.scale()) as i32;
+    move_cursor(PhysicalPoint::new(
+        rect.left + (60.0 * dpi.scale()) as i32,
+        y,
+    ));
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    for x in [80.0, 100.0, 120.0] {
+        move_cursor(PhysicalPoint::new(rect.left + (x * dpi.scale()) as i32, y));
+        pump_for(Duration::from_millis(40));
+    }
+    mouse_button(false);
+    assert!(
+        wait_for_log_contains(
+            &log_path,
+            log_start,
+            "global pen width: 480 HIMETRIC",
+            Duration::from_secs(3)
+        ),
+        "dragging to x=120 must apply x²/30 = 480 HIMETRIC; log:\n{}",
+        app_log_since(&log_path, log_start)
+    );
+    assert!(
+        wait_for_log_contains(
+            &log_path,
+            log_start,
+            "active pen width: 27.213 physical px",
+            Duration::from_secs(3)
+        ),
+        "480 HIMETRIC at 144 DPI must become 27.213 physical px; log:\n{}",
+        app_log_since(&log_path, log_start)
+    );
+    assert!(
+        !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(panel) }.as_bool(),
+        "releasing the slider closes the legacy popup"
+    );
+
+    // Reopen, then prove Esc priority: first Esc closes only the popup; the
+    // second exits annotation to Tray.
+    move_cursor(PhysicalPoint::new(button.x, button.y));
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    pump_for(Duration::from_millis(30));
+    mouse_button(false);
+    pump_for(Duration::from_millis(250));
+    assert!(unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(panel) }.as_bool());
+    send_escape();
+    assert!(wait_for_log_contains(
+        &log_path,
+        log_start,
+        "pen width panel closed by Escape",
+        Duration::from_secs(3)
+    ));
+    assert!(!app_log_since(&log_path, log_start).contains("leaving annotation: Escape"));
+    assert!(!unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(panel) }.as_bool());
+    send_escape();
+    assert!(wait_for_log_contains(
+        &log_path,
+        log_start,
+        "leaving annotation: Escape",
+        Duration::from_secs(3)
+    ));
+
+    let shell = wait_for_window(
+        w!("plnk_app_shell_window"),
+        w!("plnk"),
+        Duration::from_secs(5),
+    )
+    .expect("shell");
+    unsafe { PostMessageW(Some(shell), WM_CLOSE, WPARAM(0), LPARAM(0)) }.expect("post WM_CLOSE");
+    assert!(wait_for_exit(&mut child, Duration::from_secs(10)).success());
+}
+
+fn send_escape() {
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            0,
+        );
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
+            0,
+        );
     }
 }

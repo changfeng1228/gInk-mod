@@ -3,7 +3,9 @@
 
 pub mod animation;
 pub mod icons;
+pub mod pen_width;
 pub mod toolbar;
 
 pub use animation::{ENTER_DURATION, FAST_EXIT_DURATION, ToolbarAnimator};
+pub use pen_width::{PenWidthModel, PenWidthPanel};
 pub use toolbar::{ButtonId, ToolbarLayout, ToolbarModel, ToolbarWindow};
