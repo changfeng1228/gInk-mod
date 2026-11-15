@@ -49,7 +49,10 @@ impl StorageRoots {
 
     /// Returns the portable root when it can be created and written, otherwise
     /// the fallback root. The chosen directory is created when needed.
-    fn resolve(&self) -> Result<PathBuf, SettingsError> {
+    ///
+    /// Public so the application shell can put its log file in the same data
+    /// directory that holds `settings.ini`.
+    pub fn resolve(&self) -> Result<PathBuf, SettingsError> {
         if ensure_writable_directory(&self.portable).is_ok() {
             return Ok(self.portable.clone());
         }
