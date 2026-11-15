@@ -97,6 +97,9 @@
       <DependentUpon>FormOptions.cs</DependentUpon>
     </Compile>
     <Compile Include="Hotkey.cs" />
+    <Compile Include="HighResolutionTimer.cs">
+      <SubType>Component</SubType>
+    </Compile>
     <Compile Include="HotkeyInputBox.cs">
       <SubType>Component</SubType>
     </Compile>

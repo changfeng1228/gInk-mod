@@ -11,6 +11,14 @@ gInk 是 .NET Framework WinForms 程序，用 Windows 自带的 C# 编译器（`
 
 产物在 `build\out\`，是一个可直接运行的完整目录。
 
+动画回归测试（会短暂显示工具栏并自动退出，不需要管理员权限）：
+
+```powershell
+.\tests\run-animation-tests.ps1
+```
+
+测试会重新构建程序，检查动画逻辑与呈现回调的帧间隔、入座位移突跳、截图退出冷却时间，以及退出后定时器是否停止。
+
 ## 依赖
 
 | 项 | 说明 |
@@ -142,6 +150,7 @@ gInk 主程序以 DPI 非感知运行（见 `src\gInk.exe.manifest` 的 `<dpiAwa
 | `Root.cs` | 主控制器：托盘图标、热键注册、绘制模式、贴图集合 |
 | `FormDisplay.cs` | 全屏画布、笔画渲染、截图 |
 | `FormCollection.cs` | 工具栏与按钮 |
+| `HighResolutionTimer.cs` | 高刷新率 UI 帧调度；在 UI 线程回调，忙帧不排队 |
 | `FormOptions.*` | 选项对话框（通用/笔刷/热键三页） |
 | `PinForm.cs` | **贴图窗口**：拖动、角部缩放、滚轮缩放、透明度、复制/保存 |
 | `Hotkey.cs` | 热键解析与显示 |

@@ -38,6 +38,16 @@
 - `src/FormOptions.*`：钉图热键设置项与图标开关。
 - `Root.cs` 中 `TestMessageFilter`：新增第二全局热键（id=1）→ `SnapToPinFromDesktop()`。
 
+## 动画帧率优化（2026-11-15）
+
+高刷新率屏幕上工具栏滑入/退出动画掉帧。根因：动画逻辑与画面呈现各由 `System.Windows.Forms.Timer`（15ms）驱动，实测回调约 52–64 次/秒；即便 `timeBeginPeriod(1)` + Interval=4，WM_TIMER 与 `System.Threading.Timer` 仍被系统合并到约 15ms。
+
+- 新增 `src/HighResolutionTimer.cs`：后台调度线程 + `BeginInvoke` 回 UI 线程，忙帧不排队；仅活动期启用 1ms 计时分辨率。
+- 工具栏动画改为绝对时间缓动（入场约 300ms，快速退出约 160ms），去掉逐帧累加与 120px 钳制。
+- 定时器活动期 4ms、静止恢复 15ms；截图冷却与自动滚动改为按真实时间计时，保持原行为速度。
+- 回归测试：`tests\run-animation-tests.ps1`（动画回调帧率、入口位移平滑度、截图冷却、静止降频、退出后定时器释放）。
+- 部署前的旧 exe 备份：运行目录下 `gInk.exe.bak-before-highfps-1115`。
+
 ## 已知遗留
 
 - `src/Root.cs:166-180` 保留着 TEST HOOK（调试期用于启动即打开选项窗口）。目前靠运行目录的标记文件被禁用；若重新编译部署后仍出现开机弹窗，检查运行目录是否又出现了 `__open_options`。

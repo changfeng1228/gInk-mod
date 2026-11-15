@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -395,7 +396,7 @@ namespace gInk
 				}
 			}
 
-			LastTickTime = DateTime.Parse("1987-01-01");
+			SlideStopwatch.Reset();
 			tiSlide.Enabled = true;
 
 			ToTransparent();
@@ -755,7 +756,8 @@ namespace gInk
 			Root.SaveOptions("config.ini");
 			Root.gpPenWidthVisible = false;
 
-			LastTickTime = DateTime.Now;
+			SlideStopwatch.Reset();
+			SlideStopwatch.Start();
 			ButtonsEntering = -9;
 		}
 
@@ -771,7 +773,8 @@ namespace gInk
 				return;
 			}
 
-			LastTickTime = DateTime.Now;
+			SlideStopwatch.Reset();
+			SlideStopwatch.Start();
 			if (!Root.Docked)
 			{
 				Root.Dock();
@@ -859,6 +862,10 @@ namespace gInk
 			Root.SnappingX = -1;
 			Root.SnappingY = -1;
 			Root.Snapping = -60;
+			snappingCountdownMilliseconds = 0;
+			SlideStopwatch.Reset();
+			SlideStopwatch.Start();
+			Root.UponAllDrawingUpdate = true;
 			ButtonsEntering = 1;
 			Root.SelectPen(Root.CurrentPen);
 
@@ -876,7 +883,12 @@ namespace gInk
 			RetreatAndExit();
 		}
 
-		DateTime LastTickTime;
+		Stopwatch SlideStopwatch = new Stopwatch();
+		Stopwatch SlideAnimationStopwatch = new Stopwatch();
+		int slideAnimationState;
+		int slideStartLeft;
+		int slideTargetLeft;
+		double snappingCountdownMilliseconds;
 		bool[] LastPenStatus = new bool[10];
 		bool LastEraserStatus = false;
 		bool LastVisibleStatus = false;
@@ -997,12 +1009,16 @@ namespace gInk
 		short LastESCStatus = 0;
 		private void tiSlide_Tick(object sender, EventArgs e)
 		{
-			// ignore the first tick
-			if (LastTickTime.Year == 1987)
+			tiSlide.Interval = ButtonsEntering != 0 ? 4 : 15;
+			// Establish a precise baseline after the form has finished opening.
+			if (!SlideStopwatch.IsRunning)
 			{
-				LastTickTime = DateTime.Now;
+				SlideStopwatch.Start();
 				return;
 			}
+			float elapsedMilliseconds = (float)SlideStopwatch.Elapsed.TotalMilliseconds;
+			SlideStopwatch.Reset();
+			SlideStopwatch.Start();
 
 			int aimedleft = gpButtonsLeft;
 			if (ButtonsEntering == -9)
@@ -1023,69 +1039,59 @@ namespace gInk
 				else
 					aimedleft = gpButtonsLeft;
 			}
-			else if (ButtonsEntering == 0)
+			else
 			{
-				aimedleft = gpButtons.Left; // stay at current location
+				aimedleft = gpButtons.Left;
+				slideAnimationState = 0;
+				SlideAnimationStopwatch.Stop();
 			}
 
-			if (gpButtons.Left > aimedleft)
+			if (ButtonsEntering != 0)
 			{
-				float dleft = gpButtons.Left - aimedleft;
-				dleft /= 70;
-				if (dleft > 8) dleft = 8;
-				dleft *= (float)(DateTime.Now - LastTickTime).TotalMilliseconds;
-				if (dleft > 120) dleft = 230;
-				if (dleft < 1) dleft = 1;
-				gpButtons.Left -= (int)dleft;
-				LastTickTime = DateTime.Now;
-				if (gpButtons.Left < aimedleft)
+				if (slideAnimationState != ButtonsEntering || slideTargetLeft != aimedleft)
 				{
-					gpButtons.Left = aimedleft;
+					slideAnimationState = ButtonsEntering;
+					slideStartLeft = gpButtons.Left;
+					slideTargetLeft = aimedleft;
+					SlideAnimationStopwatch.Reset();
+					SlideAnimationStopwatch.Start();
 				}
-				gpButtons.Width = Math.Max(gpButtonsWidth - (gpButtons.Left - gpButtonsLeft), btDock.Width);
-				Root.UponButtonsUpdate |= 0x1;
-			}
-			else if (gpButtons.Left < aimedleft)
-			{
-				float dleft = aimedleft - gpButtons.Left;
-				dleft /= 70;
-				if (dleft > 8) dleft = 8;
-				// fast exiting when not docked
-				if (ButtonsEntering == -9 && !Root.Docked)
-					dleft = 8;
-				dleft *= (float)(DateTime.Now - LastTickTime).TotalMilliseconds;
-				if (dleft > 120) dleft = 120;
-				if (dleft < 1) dleft = 1;
-				// fast exiting when docked
-				if (ButtonsEntering == -9 && dleft == 1)
-					dleft = 2;
-				gpButtons.Left += (int)dleft;
-				LastTickTime = DateTime.Now;
-				if (gpButtons.Left > aimedleft)
+
+				double duration = ButtonsEntering == -9 ? 160.0 : 300.0;
+				double progress = slideStartLeft == slideTargetLeft ? 1.0 :
+					Math.Min(1.0, SlideAnimationStopwatch.Elapsed.TotalMilliseconds / duration);
+				double eased = progress * progress * (3.0 - 2.0 * progress);
+				int newleft = (int)Math.Round(slideStartLeft + (slideTargetLeft - slideStartLeft) * eased);
+				if (newleft != gpButtons.Left)
 				{
-					gpButtons.Left = aimedleft;
+					bool movingRight = newleft > gpButtons.Left;
+					gpButtons.Left = newleft;
+					gpButtons.Width = Math.Max(gpButtonsWidth - (gpButtons.Left - gpButtonsLeft), btDock.Width);
+					Root.UponButtonsUpdate |= 0x1;
+					if (movingRight)
+						Root.UponButtonsUpdate |= 0x4;
 				}
-				gpButtons.Width = Math.Max(gpButtonsWidth - (gpButtons.Left - gpButtonsLeft), btDock.Width);
-				Root.UponButtonsUpdate |= 0x1;
-				Root.UponButtonsUpdate |= 0x4;
+
+				if (ButtonsEntering == -9 && progress >= 1.0)
+				{
+					tiSlide.Enabled = false;
+					Root.StopInk();
+					return;
+				}
+				if (ButtonsEntering < 0)
+				{
+					Root.UponAllDrawingUpdate = true;
+					Root.UponButtonsUpdate = 0;
+				}
+				if (progress >= 1.0)
+				{
+					ButtonsEntering = 0;
+					slideAnimationState = 0;
+					SlideAnimationStopwatch.Stop();
+				}
 			}
 
-			if (ButtonsEntering == -9 && gpButtons.Left == aimedleft)
-			{
-				tiSlide.Enabled = false;
-				Root.StopInk();
-				return;
-			}
-			else if (ButtonsEntering < 0)
-			{
-				Root.UponAllDrawingUpdate = true;
-				Root.UponButtonsUpdate = 0;
-			}
-			if (gpButtons.Left == aimedleft)
-			{
-				ButtonsEntering = 0;
-			}
-
+			tiSlide.Interval = ButtonsEntering != 0 ? 4 : 15;
 
 
 			if (!Root.PointerMode && !this.TopMost)
@@ -1217,7 +1223,17 @@ namespace gInk
 			}
 
 			if (Root.Snapping < 0)
-				Root.Snapping++;
+			{
+				snappingCountdownMilliseconds += elapsedMilliseconds;
+				int steps = (int)(snappingCountdownMilliseconds / (1000.0 / 60.0));
+				if (steps > 0)
+				{
+					Root.Snapping = Math.Min(0, Root.Snapping + steps);
+					snappingCountdownMilliseconds -= steps * (1000.0 / 60.0);
+				}
+			}
+			else
+				snappingCountdownMilliseconds = 0;
 		}
 
 		private bool IsInsideVisibleScreen(int x, int y)

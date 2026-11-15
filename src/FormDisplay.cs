@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -100,6 +101,7 @@ namespace gInk
 
 
 			ToTopMostThrough();
+			timer1.Enabled = true;
 		}
 
 		public void ToTopMostThrough()
@@ -455,21 +457,11 @@ namespace gInk
 		}
 
 		int stackmove = 0;
-		int Tick = 0;
-		DateTime TickStartTime;
+		Stopwatch AutoScrollStopwatch = Stopwatch.StartNew();
 		private void timer1_Tick(object sender, EventArgs e)
 		{
-			Tick++;
-
-			/*
-			if (Tick == 1)
-				TickStartTime = DateTime.Now;
-			else if (Tick % 60 == 0)
-			{
-				Console.WriteLine(60 / (DateTime.Now - TickStartTime).TotalMilliseconds * 1000);
-				TickStartTime = DateTime.Now;
-			}
-			*/
+			timer1.Interval = Root.FormCollection.ButtonsEntering != 0 ||
+				Root.FormCollection.IC.CollectingInk || Root.Snapping == 2 ? 4 : 15;
 
 			if (Root.UponAllDrawingUpdate)
 			{
@@ -585,7 +577,7 @@ namespace gInk
 				int moved = Test();
 				stackmove += moved;
 
-				if (stackmove != 0 && Tick % 10 == 1)
+				if (stackmove != 0 && AutoScrollStopwatch.ElapsedMilliseconds >= 150)
 				{
 					MoveStrokes(stackmove);
 					ClearCanvus();
@@ -593,6 +585,8 @@ namespace gInk
 					DrawButtons(false);
 					UpdateFormDisplay(true);
 					stackmove = 0;
+					AutoScrollStopwatch.Reset();
+					AutoScrollStopwatch.Start();
 				}
 			}
 		}

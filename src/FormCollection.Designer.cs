@@ -40,7 +40,7 @@
 			this.btStop = new System.Windows.Forms.Button();
 			this.btClear = new System.Windows.Forms.Button();
 			this.btUndo = new System.Windows.Forms.Button();
-			this.tiSlide = new System.Windows.Forms.Timer(this.components);
+			this.tiSlide = new gInk.HighResolutionTimer(this.components, this);
 			this.toolTip = new System.Windows.Forms.ToolTip(this.components);
 			this.gpPenWidth = new System.Windows.Forms.Panel();
 			this.pboxPenWidthIndicator = new System.Windows.Forms.PictureBox();
@@ -329,7 +329,7 @@
 		public System.Windows.Forms.Button btUndo;
 		public System.Windows.Forms.Panel gpButtons;
 		public System.Windows.Forms.Button btEraser;
-		private System.Windows.Forms.Timer tiSlide;
+		private gInk.HighResolutionTimer tiSlide;
 		public System.Windows.Forms.Button btDock;
 		public System.Windows.Forms.Button btSnap;
 		public System.Windows.Forms.Button btPointer;
