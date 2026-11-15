@@ -160,14 +160,27 @@ impl WindowComposition {
         unsafe {
             self.context.BeginDraw();
             self.context.Clear(Some(&transparent));
-            let brush = self
+            // Capture a brush-creation failure instead of propagating it with
+            // `?`: EndDraw must still run, otherwise the device context stays
+            // inside BeginDraw and every later fill/draw is in a wrong-state
+            // frame (same structure as `draw` below).
+            let fill_result = match self
                 .context
                 .CreateSolidColorBrush(&brush_color, None)
-                .map_err(failed("ID2D1DeviceContext::CreateSolidColorBrush"))?;
-            self.context.FillRectangle(&area, &brush);
-            self.context
+                .map_err(failed("ID2D1DeviceContext::CreateSolidColorBrush"))
+            {
+                Ok(brush) => {
+                    self.context.FillRectangle(&area, &brush);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            };
+            let end_result = self
+                .context
                 .EndDraw(None, None)
-                .map_err(failed("ID2D1DeviceContext::EndDraw"))?;
+                .map_err(failed("ID2D1DeviceContext::EndDraw"));
+            fill_result?;
+            end_result?;
         }
         unsafe {
             self.swap_chain
