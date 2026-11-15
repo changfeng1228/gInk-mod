@@ -472,3 +472,37 @@ fn drag_threshold_suppresses_click_like_legacy() {
         "panel (1000x96) must stay inside 2560x1600"
     );
 }
+
+#[test]
+fn button_codes_roundtrip_for_the_click_notification() {
+    use ButtonId::*;
+    let buttons = [
+        Dock,
+        Eraser,
+        Pan,
+        Pointer,
+        PenWidth,
+        InkVisible,
+        Snapshot,
+        Undo,
+        Clear,
+        Exit,
+        Pen(0),
+        Pen(5),
+        Pen(9),
+    ];
+    for button in buttons {
+        assert_eq!(
+            ButtonId::from_code(button.code()),
+            Some(button),
+            "{button:?} must survive the notification encoding"
+        );
+    }
+    assert_eq!(ButtonId::from_code(0), None);
+    assert_eq!(
+        ButtonId::from_code(0x100 + 10),
+        None,
+        "only ten pen slots exist"
+    );
+    assert_eq!(ButtonId::from_code(11), None);
+}

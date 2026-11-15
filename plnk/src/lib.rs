@@ -11,6 +11,7 @@ pub mod error;
 pub mod gfx;
 pub mod hotkeys;
 pub mod ink;
+pub mod input;
 pub mod platform;
 pub mod settings;
 pub mod settings_store;

@@ -34,9 +34,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowPos, ShowWindow, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER,
+    GetSystemMetrics, HWND_TOPMOST, PostMessageW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer, SetWindowPos, ShowWindow,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_TIMER,
 };
 use windows::core::w;
 
@@ -78,6 +78,47 @@ pub enum ButtonId {
     Undo,
     Clear,
     Exit,
+}
+
+impl ButtonId {
+    /// Stable numeric encoding for the click-notification window message.
+    /// Pens occupy `0x100 + index` so the ten slots cannot collide with the
+    /// fixed action buttons.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Dock => 1,
+            Self::Eraser => 2,
+            Self::Pan => 3,
+            Self::Pointer => 4,
+            Self::PenWidth => 5,
+            Self::InkVisible => 6,
+            Self::Snapshot => 7,
+            Self::Undo => 8,
+            Self::Clear => 9,
+            Self::Exit => 10,
+            Self::Pen(index) => 0x100 + u32::from(index),
+        }
+    }
+
+    /// Inverse of [`Self::code`].
+    pub fn from_code(code: u32) -> Option<Self> {
+        Some(match code {
+            1 => Self::Dock,
+            2 => Self::Eraser,
+            3 => Self::Pan,
+            4 => Self::Pointer,
+            5 => Self::PenWidth,
+            6 => Self::InkVisible,
+            7 => Self::Snapshot,
+            8 => Self::Undo,
+            9 => Self::Clear,
+            10 => Self::Exit,
+            code if (0x100..0x100 + MAX_PEN_BUTTONS as u32).contains(&code) => {
+                Self::Pen((code - 0x100) as u8)
+            }
+            _ => return None,
+        })
+    }
 }
 
 /// Pen appearance needed to draw the toolbar button (legacy `PenAttr`).
@@ -602,6 +643,7 @@ impl ToolbarWindow {
             interaction: ToolbarInteraction::default(),
             allow_drag: settings.allow_dragging_toolbar,
             clicked: None,
+            notify: None,
             docked: false,
             strip_view: false,
             visible: false,
@@ -726,9 +768,21 @@ impl ToolbarWindow {
         self.ui.hit_test_screen(point)
     }
 
-    /// Takes the last stubbed button click; tool actions are wired in Task 8.
+    /// Takes the last stubbed button click; the application shell consumes the
+    /// same click through [`Self::set_click_notifier`].
     pub fn take_clicked(&mut self) -> Option<ButtonId> {
         self.ui.clicked.take()
+    }
+
+    /// Posts a message to `target` (with the clicked [`ButtonId::code`] in
+    /// `wparam`) whenever a button click survives the drag threshold.
+    ///
+    /// The toolbar window's own messages are dispatched inside its hook, where
+    /// the shell cannot safely be borrowed; a posted notification lets the
+    /// application handle pen selection, undo, clear and exit outside that
+    /// borrow, without a polling timer.
+    pub fn set_click_notifier(&mut self, target: HWND, message: u32) {
+        self.ui.notify = Some((target, message));
     }
 
     pub fn take_error(&mut self) -> Option<String> {
@@ -827,6 +881,9 @@ struct ToolbarUi {
     /// (the buttons still click).
     allow_drag: bool,
     clicked: Option<ButtonId>,
+    /// Where a click is announced (`HWND` as integer plus message id); set by
+    /// the application shell, `None` in tests and previews.
+    notify: Option<(HWND, u32)>,
     /// Logical docked state (also selects the dock icon).
     docked: bool,
     /// Window presentation: true when only the dock strip is shown.
@@ -1120,6 +1177,15 @@ impl ToolbarUi {
         match self.interaction.end(button) {
             ToolbarEvent::Click(id) => {
                 self.clicked = Some(id);
+                if let Some((target, message)) = self.notify {
+                    let posted = unsafe {
+                        PostMessageW(Some(target), message, WPARAM(id.code() as usize), LPARAM(0))
+                    };
+                    if posted.is_err() {
+                        // The shell window is gone (shutdown race); the click
+                        // is still available through `take_clicked`.
+                    }
+                }
                 if id == ButtonId::Dock {
                     let docked = self.docked;
                     ops.extend(self.op_dock_to(!docked));

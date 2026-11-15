@@ -1,17 +1,21 @@
-//! Headless ink model: physical-pixel strokes, smoothing geometry, dirty
-//! regions and command-based edit history.
+//! Ink: physical-pixel strokes, smoothing geometry, dirty regions, command
+//! history, the active-stroke controller and the Direct2D stroke renderer.
 //!
-//! This layer has no Win32, Direct2D or window dependencies. Task 7 renders
-//! [`Stroke::smoothed_samples`] into a cached surface and consumes
-//! [`DirtyRegion`]s; Task 8 drives tools through [`Edit`] and
-//! [`InkDocument::erase_at`]; pan and autoscroll arrive later as further
-//! commands over the same stroke list.
+//! The model layer (model/geometry/dirty/history) has no Win32, Direct2D or
+//! window dependencies and stays headless-testable. [`controller`] adds the
+//! live active-stroke lifecycle over the model; [`renderer`] is the only part
+//! that touches Direct2D and turns smoothed samples into a filled ribbon.
+//! [`Stroke::smoothed_samples`] feeds the renderer; [`DirtyRegion`]s bound both
+//! the active-layer updates and the static-cache repaints.
 
+pub mod controller;
 pub mod dirty;
 pub mod geometry;
 pub mod history;
 pub mod model;
+pub mod renderer;
 
+pub use controller::InkController;
 pub use dirty::{DirtyRect, DirtyRegion};
 pub use geometry::{PhysicalPointF, StrokeSample};
 pub use model::{
@@ -19,3 +23,4 @@ pub use model::{
     MAX_STROKE_WIDTH, MIN_PRESSURE_WIDTH_RATIO, MIN_STROKE_WIDTH, PenPoint, PenStyle, Stroke,
     StrokeId,
 };
+pub use renderer::StrokeRenderer;

@@ -15,9 +15,12 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{
     COLORREF, ERROR_CLASS_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HINSTANCE, HWND, LPARAM,
-    LRESULT, RECT, SetLastError, WPARAM,
+    LRESULT, POINT, RECT, SetLastError, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    PAINTSTRUCT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::UI::HiDpi::{
@@ -26,10 +29,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_USERDATA,
-    GetWindowLongPtrW, GetWindowLongW, GetWindowRect, LWA_ALPHA, RegisterClassExW,
-    SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowLongW, SetWindowPos, ShowWindow,
-    WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
+    GetCursorPos, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, LWA_ALPHA, RegisterClassExW,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowLongW, SetWindowPos,
+    ShowWindow, WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER,
     WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
@@ -83,33 +86,54 @@ impl WindowCounters {
 /// `now()` returns the duration since the first call in this process, which is
 /// all animation bookkeeping needs (plan §6.2: store absolute start time,
 /// duration, start and end points; no per-frame sampling loop).
+///
+/// [`Self::from_performance_count`] converts a raw QPC reading from another API
+/// — notably `POINTER_INFO::PerformanceCount` — into the same time base, so
+/// pointer timestamps and presentation timestamps can be compared directly.
 pub struct MonotonicClock;
 
 impl MonotonicClock {
     pub fn now() -> Duration {
-        static CLOCK: OnceLock<(i64, i64)> = OnceLock::new();
-        let (epoch, frequency) = *CLOCK.get_or_init(|| {
-            let mut frequency = 0i64;
-            let mut epoch = 0i64;
-            // QueryPerformanceCounter/Frequency are documented to always
-            // succeed on Windows 10+; on the impossible failure path keep a
-            // usable 1 kHz time base instead of panicking.
-            unsafe {
-                let _ = QueryPerformanceFrequency(&mut frequency);
-                let _ = QueryPerformanceCounter(&mut epoch);
-            }
-            (epoch, frequency.max(1))
-        });
+        let (epoch, frequency) = clock_base();
         let mut counter = 0i64;
         unsafe {
             let _ = QueryPerformanceCounter(&mut counter);
         }
-        let ticks = (counter - epoch).max(0) as u64;
-        let frequency = frequency as u64;
-        let seconds = ticks / frequency;
-        let nanos = (ticks % frequency).saturating_mul(1_000_000_000) / frequency;
-        Duration::new(seconds, nanos as u32)
+        duration_since(epoch, frequency, counter)
     }
+
+    /// Converts a raw QPC counter reading (for example the `PerformanceCount`
+    /// field of `POINTER_INFO`) into the [`Self::now`] time base. Readings
+    /// before the process clock epoch clamp to zero.
+    pub fn from_performance_count(counter: i64) -> Duration {
+        let (epoch, frequency) = clock_base();
+        duration_since(epoch, frequency, counter)
+    }
+}
+
+/// Process clock epoch (QPC tick of the first use) and frequency.
+fn clock_base() -> (i64, i64) {
+    static CLOCK: OnceLock<(i64, i64)> = OnceLock::new();
+    *CLOCK.get_or_init(|| {
+        let mut frequency = 0i64;
+        let mut epoch = 0i64;
+        // QueryPerformanceCounter/Frequency are documented to always succeed
+        // on Windows 10+; on the impossible failure path keep a usable 1 kHz
+        // time base instead of panicking.
+        unsafe {
+            let _ = QueryPerformanceFrequency(&mut frequency);
+            let _ = QueryPerformanceCounter(&mut epoch);
+        }
+        (epoch, frequency.max(1))
+    })
+}
+
+fn duration_since(epoch: i64, frequency: i64, counter: i64) -> Duration {
+    let ticks = (counter - epoch).max(0) as u64;
+    let frequency = frequency.max(1) as u64;
+    let seconds = ticks / frequency;
+    let nanos = (ticks % frequency).saturating_mul(1_000_000_000) / frequency;
+    Duration::new(seconds, nanos as u32)
 }
 
 /// Transparent, topmost ink overlay window.
@@ -126,7 +150,20 @@ pub struct OverlayWindow {
 
 impl OverlayWindow {
     pub fn new(device: &GraphicsDevice, bounds: PhysicalRect) -> Result<Self, GfxError> {
-        let window = NativeWindow::create(bounds, w!("plnk overlay"), true)?;
+        Self::new_with_hook(device, bounds, None, std::ptr::null_mut())
+    }
+
+    /// Creates the overlay with a window-procedure hook, used by the drawing
+    /// session to receive `WM_POINTER`/mouse input. The data pointer contract
+    /// is documented on [`WindowHook`].
+    pub(crate) fn new_with_hook(
+        device: &GraphicsDevice,
+        bounds: PhysicalRect,
+        hook: Option<WindowHook>,
+        hook_data: *mut core::ffi::c_void,
+    ) -> Result<Self, GfxError> {
+        let window =
+            NativeWindow::create_with_hook(bounds, w!("plnk overlay"), true, hook, hook_data)?;
         let composition = WindowComposition::new(
             device,
             window.hwnd(),
@@ -147,6 +184,12 @@ impl OverlayWindow {
         self.window.window_rect()
     }
 
+    /// The swap-chain composition owned by this window (used by the ink
+    /// surface to present the static/active caches).
+    pub(crate) fn composition_mut(&mut self) -> &mut WindowComposition {
+        &mut self.composition
+    }
+
     /// Fills the whole overlay with `color` (alpha is honored by DWM).
     pub fn fill(&mut self, color: Rgba8) -> Result<(), GfxError> {
         self.composition.fill(color)
@@ -154,6 +197,10 @@ impl OverlayWindow {
 
     pub fn show(&self) {
         self.window.show();
+    }
+
+    pub fn hide(&self) {
+        self.window.hide();
     }
 
     /// Toggles input pass-through. `true` = pointer mode (input reaches the
@@ -178,7 +225,13 @@ pub struct ToolbarWindow {
 
 impl ToolbarWindow {
     pub fn new(device: &GraphicsDevice, bounds: PhysicalRect) -> Result<Self, GfxError> {
-        let window = NativeWindow::create(bounds, w!("plnk toolbar"), false)?;
+        let window = NativeWindow::create_with_hook(
+            bounds,
+            w!("plnk toolbar"),
+            false,
+            None,
+            std::ptr::null_mut(),
+        )?;
         let composition = WindowComposition::new(
             device,
             window.hwnd(),
@@ -275,10 +328,6 @@ pub(crate) struct NativeWindow {
 }
 
 impl NativeWindow {
-    fn create(bounds: PhysicalRect, title: PCWSTR, layered: bool) -> Result<Self, GfxError> {
-        Self::create_with_hook(bounds, title, layered, None, std::ptr::null_mut())
-    }
-
     pub(crate) fn create_with_hook(
         bounds: PhysicalRect,
         title: PCWSTR,
@@ -376,9 +425,15 @@ impl NativeWindow {
         self.context.counters.snapshot()
     }
 
-    fn show(&self) {
+    pub(crate) fn show(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+
+    pub(crate) fn hide(&self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
     }
 
@@ -393,7 +448,7 @@ impl NativeWindow {
         ))
     }
 
-    fn set_click_through(&mut self, enabled: bool) -> Result<(), GfxError> {
+    pub(crate) fn set_click_through(&mut self, enabled: bool) -> Result<(), GfxError> {
         let current = unsafe { GetWindowLongW(self.hwnd, GWL_EXSTYLE) } as u32;
         let mut updated = current & !WS_EX_TRANSPARENT.0;
         if enabled {
@@ -442,6 +497,34 @@ impl NativeWindow {
 impl Drop for NativeWindow {
     fn drop(&mut self) {
         self.destroy();
+    }
+}
+
+/// Physical bounds of the monitor that currently contains the mouse cursor.
+///
+/// The first release targets the current monitor only (spec §2/§4); a
+/// multi-monitor virtual-screen overlay remains 未验证.
+pub fn current_monitor_rect() -> Result<PhysicalRect, GfxError> {
+    let mut point = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut point);
+    }
+    let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        Ok(PhysicalRect::new(
+            info.rcMonitor.left,
+            info.rcMonitor.top,
+            info.rcMonitor.right,
+            info.rcMonitor.bottom,
+        ))
+    } else {
+        Err(failed("GetMonitorInfoW")(
+            windows::core::Error::from_thread(),
+        ))
     }
 }
 

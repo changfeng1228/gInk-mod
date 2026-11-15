@@ -28,7 +28,12 @@ opt-level = 3
 #   single-instance guard passes a null attributes pointer but still needs the
 #   namespace to compile.
 # - UI_Input_KeyboardAndMouse: `RegisterHotKey`/`UnregisterHotKey` and the
-#   `MOD_*`/`VK_*` constants for the global hotkeys.
+#   `MOD_*`/`VK_*` constants for the global hotkeys, plus `mouse_event` in the
+#   desktop acceptance test.
+# - UI_Input_Pointer: `WM_POINTER` handling — `GetPointerInfo`,
+#   `GetPointerType`, `GetPointerPenInfoHistory`/`GetPointerTouchInfoHistory`/
+#   `GetPointerInfoHistory` (coalesced history), `POINTER_INFO`/`POINTER_PEN_INFO`
+#   and the pen flags/masks needed for pressure and the eraser end (plan §6.3).
 # - UI_Shell: `Shell_NotifyIconW` and `NOTIFYICONDATAW` for the tray icon.
 #
 # `windows-numerics` is not a new runtime dependency: it is already compiled as
@@ -38,5 +43,5 @@ opt-level = 3
 # version merely makes those types nameable; no additional code or binary size
 # is added.
 [dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_DirectComposition", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Pointer", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows-numerics = "0.3.1"

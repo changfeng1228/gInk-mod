@@ -3,9 +3,11 @@
 
 pub mod composition;
 pub mod device;
+pub mod ink_surface;
 
 pub use composition::Easing;
 pub use device::{CompositionFrameStats, GfxError, GraphicsDevice};
+pub use ink_surface::{InkSurface, PresentStats};
 
 /// Straight (non-premultiplied) 8-bit color used at the API boundary.
 ///

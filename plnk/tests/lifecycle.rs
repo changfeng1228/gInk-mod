@@ -480,13 +480,15 @@ fn hotkey_map_matches_keyboard_events() {
 /// app: `--no-hotkeys` must be understood, and the smoke exit hook is opt-in.
 #[test]
 fn run_options_parse_development_flags() {
-    let options = RunOptions::from_args(["--no-hotkeys", "--exit-after-ms", "250"])
+    let options = RunOptions::from_args(["--no-hotkeys", "--draw", "--exit-after-ms", "250"])
         .expect("parse development flags");
     assert!(options.no_hotkeys);
+    assert!(options.draw_mode);
     assert_eq!(options.exit_after, Some(Duration::from_millis(250)));
 
     let defaults = RunOptions::from_args(std::iter::empty::<&str>()).expect("parse no flags");
     assert!(!defaults.no_hotkeys);
+    assert!(!defaults.draw_mode);
     assert_eq!(defaults.exit_after, None);
 
     let error = RunOptions::from_args(["--unknown-flag"]).expect_err("unknown flags are errors");

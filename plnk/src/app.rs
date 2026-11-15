@@ -28,21 +28,36 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
     GetMessageW, GetWindowLongPtrW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NCCREATE,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN,
+    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{Error as WindowsError, HRESULT, HSTRING, PCWSTR, w};
 
 use crate::error::SettingsError;
+use crate::gfx::Rgba8;
+use crate::gfx::device::{GfxError, GraphicsDevice};
+use crate::gfx::ink_surface::InkSurface;
 use crate::hotkeys::{Command, GlobalHotkeys, HotkeyIssue, HotkeyMap};
-use crate::settings::Settings;
+use crate::ink::controller::InkController;
+use crate::ink::dirty::DirtyRegion;
+use crate::ink::geometry::PhysicalPointF;
+use crate::ink::model::{Edit, PenStyle};
+use crate::input::{MouseNormalizer, PointerKind, PointerNormalizer};
+use crate::platform::dpi::PhysicalRect;
+use crate::platform::window::{MonotonicClock, current_monitor_rect};
+use crate::settings::{PenSettings, Settings};
 use crate::settings_store::StorageRoots;
 use crate::telemetry::{LogError, LogSink};
 use crate::tray::{MENU_EXIT, TrayError, TrayIcon};
+use crate::ui::toolbar::{ButtonId, ToolbarWindow as ToolbarUiWindow};
 
 /// Singleton mutex of the new app. Deliberately different from the legacy
 /// gInk GUID, so the legacy instance and a development build can coexist.
@@ -56,6 +71,9 @@ pub const SHELL_WINDOW_TITLE: &str = "plnk";
 pub const TRAY_CALLBACK_MESSAGE: u32 = WM_APP + 20;
 /// Wake-up message posted by the bounded IO worker when a result is ready.
 pub const IO_RESULT_MESSAGE: u32 = WM_APP + 21;
+/// Posted by the toolbar when the user clicks a button; `wparam` carries
+/// [`ButtonId::code`].
+pub const TOOLBAR_CLICK_MESSAGE: u32 = WM_APP + 22;
 
 const EXIT_TIMER_ID: usize = 0x504C; // "PL"
 const IO_QUEUE_CAPACITY: usize = 8;
@@ -94,11 +112,13 @@ impl AppMode {
 }
 
 /// Development options. `--no-hotkeys` keeps a test run from claiming the
-/// legacy app's combinations; `--exit-after-ms` lets the desktop smoke test
-/// start and stop the real shell without synthetic input.
+/// legacy app's combinations; `--draw` enters drawing mode without the tray or
+/// hotkey (desktop acceptance and quick previews); `--exit-after-ms` lets the
+/// desktop smoke test start and stop the real shell without synthetic input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     pub no_hotkeys: bool,
+    pub draw_mode: bool,
     pub exit_after: Option<Duration>,
 }
 
@@ -114,6 +134,7 @@ impl RunOptions {
             let argument = argument.as_ref().to_string_lossy().into_owned();
             match argument.as_str() {
                 "--no-hotkeys" => options.no_hotkeys = true,
+                "--draw" => options.draw_mode = true,
                 "--exit-after-ms" => {
                     let value = args.next().ok_or_else(|| {
                         AppError::Usage(
@@ -128,7 +149,7 @@ impl RunOptions {
                 }
                 _ => {
                     return Err(AppError::Usage(format!(
-                        "unknown argument: {argument} (supported: --no-hotkeys, --exit-after-ms <ms>)"
+                        "unknown argument: {argument} (supported: --no-hotkeys, --draw, --exit-after-ms <ms>)"
                     )));
                 }
             }
@@ -150,6 +171,12 @@ pub enum AppError {
         context: &'static str,
         source: WindowsError,
     },
+    Graphics {
+        context: &'static str,
+        source: GfxError,
+    },
+    /// An internal invariant that should be impossible to violate.
+    Runtime(String),
     IoWorker(io::Error),
     MessageLoop(WindowsError),
 }
@@ -170,6 +197,10 @@ impl std::fmt::Display for AppError {
                     "application window failed while {context}: {source}"
                 )
             }
+            Self::Graphics { context, source } => {
+                write!(formatter, "drawing stack failed while {context}: {source}")
+            }
+            Self::Runtime(message) => write!(formatter, "internal error: {message}"),
             Self::IoWorker(error) => {
                 write!(
                     formatter,
@@ -192,6 +223,8 @@ impl std::error::Error for AppError {
             Self::Instance(error) => Some(error),
             Self::Tray(error) => Some(error),
             Self::Window { source, .. } | Self::MessageLoop(source) => Some(source),
+            Self::Graphics { source, .. } => Some(source),
+            Self::Runtime(_) => None,
             Self::IoWorker(error) => Some(error),
         }
     }
@@ -212,6 +245,15 @@ impl From<LogError> for AppError {
 impl From<TrayError> for AppError {
     fn from(error: TrayError) -> Self {
         Self::Tray(error)
+    }
+}
+
+impl From<GfxError> for AppError {
+    fn from(source: GfxError) -> Self {
+        Self::Graphics {
+            context: "drawing the annotation overlay",
+            source,
+        }
     }
 }
 
@@ -297,6 +339,10 @@ impl App {
         let hwnd = window.hwnd();
         shell.window = Some(window);
         shell.start_services(hwnd)?;
+        if shell.options.draw_mode {
+            // Development switch: enter drawing mode without the tray/hotkey.
+            shell.handle_command(Command::ToggleInk);
+        }
         // Free function: no `&mut Shell` may be live while the pump dispatches
         // messages, because a nested modal loop (tray menu) can re-enter the
         // window procedure and borrow the shell again.
@@ -544,6 +590,454 @@ impl Drop for IoWorker {
     }
 }
 
+/// Operations a drawing-session message produces that must run after the
+/// session borrow ends (`SetCapture`/`ReleaseCapture` synchronously send
+/// `WM_CAPTURECHANGED` back into the window procedure).
+enum SessionOp {
+    SetCapture,
+    ReleaseCapture,
+}
+
+/// The live drawing session: ink surface, controller and input normalizers.
+///
+/// The overlay window created by [`InkSurface`] routes its messages to
+/// [`session_hook`] with a pointer to this struct, so a `Box<InkSession>` must
+/// never move its contents (the `Box` itself may move freely). The surface is
+/// the first field so the window — and its hook back-pointer — is destroyed
+/// before the rest of the session state.
+pub struct InkSession {
+    surface: Option<InkSurface>,
+    controller: InkController,
+    pen_style: PenStyle,
+    pointer: PointerNormalizer,
+    mouse: MouseNormalizer,
+    active_pointer: Option<u32>,
+    mouse_down: bool,
+    last_error: Option<String>,
+}
+
+impl InkSession {
+    /// Creates the overlay and starts routing its input to the session.
+    pub fn new(device: &GraphicsDevice, bounds: PhysicalRect) -> Result<Box<Self>, GfxError> {
+        let mut session = Box::new(Self {
+            surface: None,
+            controller: InkController::new(),
+            pen_style: PenStyle::fixed(Rgba8::new(0, 0, 0, 255), 80.0),
+            pointer: PointerNormalizer::new(),
+            mouse: MouseNormalizer::new(),
+            active_pointer: None,
+            mouse_down: false,
+            last_error: None,
+        });
+        let data = &mut *session as *mut Self as *mut core::ffi::c_void;
+        let surface = InkSurface::new_with_hook(device, bounds, session_hook, data)?;
+        session.surface = Some(surface);
+        Ok(session)
+    }
+
+    pub fn surface(&self) -> Option<&InkSurface> {
+        self.surface.as_ref()
+    }
+
+    pub fn surface_mut(&mut self) -> Option<&mut InkSurface> {
+        self.surface.as_mut()
+    }
+
+    pub fn controller(&self) -> &InkController {
+        &self.controller
+    }
+
+    /// Style for the next stroke (color, width, highlighter alpha). The
+    /// pressure channel is enabled per contact from the pointer capability.
+    pub fn set_pen_style(&mut self, style: PenStyle) {
+        self.pen_style = PenStyle::new(style.color, style.width, style.pressure_enabled);
+    }
+
+    /// First error since the last call; the shell logs it on its next command
+    /// or toolbar event (a drawing failure must not panic or kill the app).
+    pub fn take_error(&mut self) -> Option<String> {
+        self.last_error.take()
+    }
+
+    /// Cancels any live contact. Mode changes call this before flipping input
+    /// pass-through so a partial stroke never commits.
+    pub fn cancel_active(&mut self) -> Result<(), GfxError> {
+        self.drop_active()
+    }
+
+    /// Undoes the last edit and repaints only its pixels.
+    pub fn undo(&mut self) -> Result<(), GfxError> {
+        self.drop_active()?;
+        let Some(region) = self.controller.document_mut().undo() else {
+            return Ok(());
+        };
+        self.redraw_and_present(&region)
+    }
+
+    /// Clears the canvas as an undoable edit.
+    pub fn clear(&mut self) -> Result<(), GfxError> {
+        self.drop_active()?;
+        let region = self.controller.document_mut().apply(Edit::Clear);
+        if region.is_empty() {
+            return Ok(());
+        }
+        self.redraw_and_present(&region)
+    }
+
+    /// Leaving annotation: drop a live contact and clear the canvas through the
+    /// command history (legacy `RetreatAndExit`; undo after reopening restores
+    /// the pre-exit strokes, same process only).
+    pub fn close_annotation(&mut self) -> Result<(), GfxError> {
+        self.drop_active()?;
+        let region = self.controller.document_mut().close_annotation();
+        if region.is_empty() {
+            return Ok(());
+        }
+        self.redraw_and_present(&region)
+    }
+
+    /// Re-entering annotation without touching the in-memory history.
+    pub fn reopen_annotation(&mut self) {
+        self.controller.document_mut().reopen_annotation();
+    }
+
+    fn on_message(
+        &mut self,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> (bool, Vec<SessionOp>) {
+        match message {
+            WM_LBUTTONDOWN => {
+                let began = self.mouse_down(lparam);
+                let ops = if began {
+                    vec![SessionOp::SetCapture]
+                } else {
+                    Vec::new()
+                };
+                (began, ops)
+            }
+            WM_MOUSEMOVE => {
+                self.mouse_move(lparam);
+                (self.mouse_down, Vec::new())
+            }
+            WM_LBUTTONUP => {
+                let releasing = self.mouse_up(lparam);
+                let ops = if releasing {
+                    vec![SessionOp::ReleaseCapture]
+                } else {
+                    Vec::new()
+                };
+                (releasing, ops)
+            }
+            WM_CAPTURECHANGED => {
+                if self.mouse_down {
+                    self.cancel_contact();
+                }
+                (false, Vec::new())
+            }
+            // Pointer messages are always consumed so `DefWindowProcW` does not
+            // promote an unhandled touch/pen contact into a duplicate mouse
+            // stroke; the "no pointer messages" case is a physical mouse, whose
+            // WM_MOUSE messages arrive on the fallback path above.
+            WM_POINTERDOWN => {
+                self.pointer_down(wparam);
+                (true, Vec::new())
+            }
+            WM_POINTERUPDATE => {
+                self.pointer_update(wparam);
+                (true, Vec::new())
+            }
+            WM_POINTERUP => {
+                self.pointer_up(wparam);
+                (true, Vec::new())
+            }
+            WM_POINTERLEAVE => {
+                if self.active_pointer.is_some() {
+                    self.cancel_contact();
+                }
+                (true, Vec::new())
+            }
+            WM_POINTERCAPTURECHANGED => {
+                if self.active_pointer.is_some() {
+                    self.cancel_contact();
+                }
+                (true, Vec::new())
+            }
+            _ => (false, Vec::new()),
+        }
+    }
+
+    fn mouse_down(&mut self, lparam: LPARAM) -> bool {
+        if self.controller.is_drawing() || self.active_pointer.is_some() {
+            return false;
+        }
+        let Some(position) = self.client_position(lparam) else {
+            return false;
+        };
+        self.apply_style(false);
+        let point = self.mouse.sample(position, MonotonicClock::now());
+        let dirty = self.controller.begin(point);
+        self.mouse_down = true;
+        self.after_append(dirty);
+        true
+    }
+
+    fn mouse_move(&mut self, lparam: LPARAM) {
+        if !self.mouse_down || self.active_pointer.is_some() {
+            return;
+        }
+        let Some(position) = self.client_position(lparam) else {
+            return;
+        };
+        let point = self.mouse.sample(position, MonotonicClock::now());
+        let dirty = self.controller.append(&[point]);
+        self.after_append(dirty);
+    }
+
+    fn mouse_up(&mut self, lparam: LPARAM) -> bool {
+        if !self.mouse_down {
+            return false;
+        }
+        self.mouse_down = false;
+        if let Some(position) = self.client_position(lparam) {
+            let point = self.mouse.sample(position, MonotonicClock::now());
+            let _ = self.controller.append(&[point]);
+        }
+        if let Err(error) = self.commit_active() {
+            self.record_error(error);
+        }
+        true
+    }
+
+    fn pointer_down(&mut self, wparam: WPARAM) {
+        if self.controller.is_drawing() || self.mouse_down || self.active_pointer.is_some() {
+            return;
+        }
+        let Some((id, info)) = pointer_info(wparam) else {
+            return;
+        };
+        let points = self.pointer.next(info);
+        if self.pointer.is_eraser() {
+            // The inverted pen end is the eraser tool; tool behavior is Task 8.
+            // Drawing ink with the eraser end would be plainly wrong, so the
+            // contact is ignored (recorded as 未验证 in the stylus notes).
+            return;
+        }
+        if points.is_empty() {
+            return;
+        }
+        let pressure = self.pointer.kind() == PointerKind::Pen && self.pointer.pressure_supported();
+        self.apply_style(pressure);
+        let mut dirty = self.controller.begin(points[0]);
+        dirty.union(&self.controller.append(&points[1..]));
+        self.active_pointer = Some(id);
+        self.after_append(dirty);
+    }
+
+    fn pointer_update(&mut self, wparam: WPARAM) {
+        let Some(active) = self.active_pointer else {
+            return;
+        };
+        let Some((id, info)) = pointer_info(wparam) else {
+            return;
+        };
+        if id != active {
+            return;
+        }
+        let points = self.pointer.next(info);
+        if points.is_empty() {
+            return;
+        }
+        let dirty = self.controller.append(&points);
+        self.after_append(dirty);
+    }
+
+    fn pointer_up(&mut self, wparam: WPARAM) {
+        let Some(active) = self.active_pointer else {
+            return;
+        };
+        let Some((id, info)) = pointer_info(wparam) else {
+            return;
+        };
+        if id != active {
+            return;
+        }
+        let points = self.pointer.next(info);
+        if !points.is_empty() {
+            let _ = self.controller.append(&points);
+        }
+        self.active_pointer = None;
+        if let Err(error) = self.commit_active() {
+            self.record_error(error);
+        }
+    }
+
+    /// A second contact, a lost capture or a mode change: discard the partial
+    /// stroke and clear the active layer — never commit it.
+    fn cancel_contact(&mut self) {
+        if let Err(error) = self.drop_active() {
+            self.record_error(error);
+        }
+    }
+
+    fn drop_active(&mut self) -> Result<(), GfxError> {
+        let region = self.controller.cancel();
+        self.active_pointer = None;
+        self.mouse_down = false;
+        if region.is_empty() {
+            return Ok(());
+        }
+        let Self { surface, .. } = self;
+        let Some(surface) = surface.as_mut() else {
+            return Ok(());
+        };
+        surface.clear_active(&region)?;
+        surface.present(region).map(|_| ())
+    }
+
+    fn commit_active(&mut self) -> Result<(), GfxError> {
+        let Some(region) = self.controller.end() else {
+            return Ok(());
+        };
+        let Self {
+            controller,
+            surface,
+            ..
+        } = self;
+        let Some(surface) = surface.as_mut() else {
+            return Ok(());
+        };
+        // The static cache is additive on commit: draw the new stroke on top,
+        // then clear its copy from the active layer.
+        let Some(stroke) = controller.document().strokes().last() else {
+            return Ok(());
+        };
+        surface.draw_committed(stroke, &region)?;
+        surface.clear_active(&region)?;
+        surface.present(region).map(|_| ())
+    }
+
+    fn redraw_and_present(&mut self, region: &DirtyRegion) -> Result<(), GfxError> {
+        let Self {
+            controller,
+            surface,
+            ..
+        } = self;
+        let Some(surface) = surface.as_mut() else {
+            return Ok(());
+        };
+        surface.redraw_static(controller.document(), region)?;
+        surface.present(region.clone()).map(|_| ())
+    }
+
+    fn after_append(&mut self, region: DirtyRegion) {
+        if region.is_empty() {
+            return;
+        }
+        let result = {
+            let Self {
+                controller,
+                surface,
+                ..
+            } = self;
+            match surface.as_mut() {
+                Some(surface) => match controller.active() {
+                    Some(active) => surface
+                        .draw_active(active, &region)
+                        .and_then(|()| surface.present(region).map(|_| ())),
+                    None => Ok(()),
+                },
+                None => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            self.record_error(error);
+        }
+    }
+
+    fn apply_style(&mut self, pressure_enabled: bool) {
+        let mut style = self.pen_style;
+        style.pressure_enabled = pressure_enabled;
+        self.controller.set_style(style);
+    }
+
+    fn client_position(&self, lparam: LPARAM) -> Option<PhysicalPointF> {
+        let x = i32::from((lparam.0 & 0xFFFF) as u16 as i16);
+        let y = i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16);
+        let rect = self.surface.as_ref()?.window_rect().ok()?;
+        Some(PhysicalPointF::new(
+            (rect.left + x) as f32,
+            (rect.top + y) as f32,
+        ))
+    }
+
+    fn record_error(&mut self, error: GfxError) {
+        if self.last_error.is_none() {
+            self.last_error = Some(error.to_string());
+        }
+    }
+}
+
+fn pointer_info(wparam: WPARAM) -> Option<(u32, POINTER_INFO)> {
+    let pointer_id = (wparam.0 & 0xFFFF) as u32;
+    let mut info = POINTER_INFO::default();
+    unsafe { GetPointerInfo(pointer_id, &mut info) }
+        .ok()
+        .map(|()| (pointer_id, info))
+}
+
+/// Window-procedure hook of the ink overlay.
+///
+/// # Safety
+/// `data` is the live `Box<InkSession>` registered by [`InkSession::new`]; the
+/// overlay clears the hook before the session (and its window) is destroyed.
+unsafe fn session_hook(
+    data: *mut core::ffi::c_void,
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let (handled, ops) = {
+        // The borrow ends before the capture operations below: SetCapture and
+        // ReleaseCapture synchronously send WM_CAPTURECHANGED back into this
+        // procedure, which must be free to borrow the session itself.
+        let session = unsafe { &mut *(data as *mut InkSession) };
+        session.on_message(message, wparam, lparam)
+    };
+    for op in ops {
+        match op {
+            SessionOp::SetCapture => {
+                unsafe { SetCapture(hwnd) };
+            }
+            SessionOp::ReleaseCapture => unsafe {
+                let _ = ReleaseCapture();
+            },
+        }
+    }
+    handled.then_some(LRESULT(0))
+}
+
+fn pen_style(pen: &PenSettings) -> PenStyle {
+    PenStyle::fixed(
+        Rgba8::new(pen.color.red, pen.color.green, pen.color.blue, pen.alpha),
+        f32::from(pen.width),
+    )
+}
+
+fn default_pen_index(settings: &Settings) -> usize {
+    if settings.pens[1].enabled {
+        1
+    } else {
+        settings
+            .pens
+            .iter()
+            .position(|pen| pen.enabled)
+            .unwrap_or(1)
+    }
+}
+
 /// The hidden shell window. `Drop` clears the window-procedure back-pointer
 /// before destroying the HWND, so no message can reach a half-dropped shell.
 struct ShellWindow {
@@ -630,9 +1124,17 @@ struct Shell {
     hotkeys: Option<GlobalHotkeys>,
     io: Option<IoWorker>,
     completions: Option<Arc<PostMessageCompletion>>,
+    // Drawing stack, in dependency order: the session owns the overlay window,
+    // the toolbar is a sibling window, and both use the graphics device. They
+    // are created lazily on the first drawing session and stay alive until
+    // shutdown (Task 13 owns full idle-resource reclamation).
+    ink: Option<Box<InkSession>>,
+    toolbar: Option<ToolbarUiWindow>,
+    gfx: Option<GraphicsDevice>,
     settings: Settings,
     options: RunOptions,
     mode: AppMode,
+    pen_index: usize,
     log: LogSink,
     exit_requested: bool,
     menu_open: bool,
@@ -642,15 +1144,20 @@ struct Shell {
 
 impl Shell {
     fn new(settings: Settings, options: RunOptions, log: LogSink) -> Self {
+        let pen_index = default_pen_index(&settings);
         Self {
             window: None,
             tray: None,
             hotkeys: None,
             io: None,
             completions: None,
+            ink: None,
+            toolbar: None,
+            gfx: None,
             settings,
             options,
             mode: AppMode::Tray,
+            pen_index,
             log,
             exit_requested: false,
             menu_open: false,
@@ -752,11 +1259,244 @@ impl Shell {
 
     fn handle_command(&mut self, command: Command) {
         let previous = self.mode;
-        self.mode = previous.after_command(command);
-        self.log.info(&format!(
-            "command {command:?}: mode {previous:?} -> {:?}",
-            self.mode
-        ));
+        let next = previous.after_command(command);
+        if next == previous {
+            return;
+        }
+        match self.apply_mode(previous, next) {
+            Ok(()) => {
+                self.mode = next;
+                self.log.info(&format!(
+                    "command {command:?}: mode {previous:?} -> {next:?}"
+                ));
+            }
+            Err(error) => {
+                self.log.warn(&format!(
+                    "command {command:?}: could not enter {next:?} ({error}); staying in {previous:?}"
+                ));
+            }
+        }
+        self.log_ink_error();
+    }
+
+    /// Applies the side effects of a mode transition. On failure the caller
+    /// keeps the previous mode so the state machine never claims a mode whose
+    /// windows failed to appear.
+    fn apply_mode(&mut self, previous: AppMode, next: AppMode) -> Result<(), AppError> {
+        match (previous, next) {
+            (AppMode::Tray, AppMode::Drawing) => self.enter_annotation(),
+            (AppMode::Drawing, AppMode::Pointer) => self.set_ink_click_through(true),
+            (AppMode::Pointer, AppMode::Drawing) => self.set_ink_click_through(false),
+            _ => Ok(()),
+        }
+    }
+
+    /// Creates the graphics device, drawing session and toolbar on first use.
+    fn ensure_drawing_stack(&mut self) -> Result<(), AppError> {
+        if self.gfx.is_none() {
+            let device = GraphicsDevice::new().map_err(|source| AppError::Graphics {
+                context: "creating the graphics device",
+                source,
+            })?;
+            self.gfx = Some(device);
+            self.log.info("graphics device created");
+        }
+        if self.ink.is_some() && self.toolbar.is_some() {
+            return Ok(());
+        }
+        let bounds = current_monitor_rect().map_err(|source| AppError::Graphics {
+            context: "querying the current monitor",
+            source,
+        })?;
+        if self.ink.is_none() {
+            let Some(device) = self.gfx.as_ref() else {
+                return Err(AppError::Runtime(
+                    "graphics device missing after initialization".to_owned(),
+                ));
+            };
+            let mut session =
+                InkSession::new(device, bounds).map_err(|source| AppError::Graphics {
+                    context: "creating the ink overlay",
+                    source,
+                })?;
+            session.set_pen_style(pen_style(&self.settings.pens[self.pen_index]));
+            self.ink = Some(session);
+            self.log.info(&format!(
+                "ink overlay created at {}x{} physical pixels",
+                bounds.width(),
+                bounds.height()
+            ));
+        }
+        if self.toolbar.is_none() {
+            let Some(device) = self.gfx.as_ref() else {
+                return Err(AppError::Runtime(
+                    "graphics device missing after initialization".to_owned(),
+                ));
+            };
+            let mut toolbar = ToolbarUiWindow::new(device, &self.settings).map_err(|source| {
+                AppError::Graphics {
+                    context: "creating the toolbar window",
+                    source,
+                }
+            })?;
+            if let Some(window) = self.window.as_ref() {
+                toolbar.set_click_notifier(window.hwnd(), TOOLBAR_CLICK_MESSAGE);
+            }
+            self.toolbar = Some(toolbar);
+            self.log.info("toolbar window created");
+        }
+        Ok(())
+    }
+
+    fn enter_annotation(&mut self) -> Result<(), AppError> {
+        self.ensure_drawing_stack()?;
+        if let Some(session) = self.ink.as_mut() {
+            session.reopen_annotation();
+            if let Some(surface) = session.surface_mut() {
+                surface.set_click_through(false)?;
+                surface.show();
+            }
+        }
+        if let Some(toolbar) = self.toolbar.as_mut()
+            && let Err(error) = toolbar.enter()
+        {
+            // Do not leave an interactive, inkless overlay behind when the
+            // toolbar cannot appear; the mode machine stays in Tray.
+            if let Some(session) = self.ink.as_mut() {
+                if let Some(surface) = session.surface_mut() {
+                    let _ = surface.set_click_through(true);
+                }
+                if let Some(surface) = session.surface() {
+                    surface.hide();
+                }
+            }
+            return Err(AppError::from(error));
+        }
+        Ok(())
+    }
+
+    /// Back to tray mode: drop a live contact, clear through the history, hide
+    /// the overlay and slide the toolbar out. The graphics stack stays alive for
+    /// the next session (undo restoring pre-exit strokes is same-process only).
+    fn exit_annotation(&mut self, reason: &str) {
+        self.log.info(&format!("leaving annotation: {reason}"));
+        if let Some(session) = self.ink.as_mut() {
+            if let Err(error) = session.close_annotation() {
+                self.log.warn(&format!("could not clear ink: {error}"));
+            }
+            if let Some(surface) = session.surface_mut()
+                && let Err(error) = surface.set_click_through(true)
+            {
+                self.log
+                    .warn(&format!("could not enable click-through: {error}"));
+            }
+            if let Some(surface) = session.surface() {
+                surface.hide();
+            }
+        }
+        if let Some(toolbar) = self.toolbar.as_mut()
+            && let Err(error) = toolbar.fast_exit()
+        {
+            self.log
+                .warn(&format!("could not hide the toolbar: {error}"));
+        }
+        self.mode = AppMode::Tray;
+        self.log_ink_error();
+    }
+
+    fn set_ink_click_through(&mut self, enabled: bool) -> Result<(), AppError> {
+        if let Some(session) = self.ink.as_mut() {
+            // A mode flip is a cancellation point: a partial stroke must never
+            // commit when input pass-through changes mid-contact.
+            if let Err(error) = session.cancel_active() {
+                self.log
+                    .warn(&format!("could not cancel the live stroke: {error}"));
+            }
+            if let Some(surface) = session.surface_mut() {
+                surface.set_click_through(enabled)?;
+            }
+            self.log.info(if enabled {
+                "ink overlay is click-through (pointer mode)"
+            } else {
+                "ink overlay accepts input (drawing mode)"
+            });
+        }
+        Ok(())
+    }
+
+    fn select_pen(&mut self, index: usize) {
+        if index >= self.settings.pens.len() {
+            self.log.warn(&format!("pen index {index} is out of range"));
+            return;
+        }
+        self.pen_index = index;
+        if let Some(session) = self.ink.as_mut() {
+            session.set_pen_style(pen_style(&self.settings.pens[index]));
+        }
+        if let Some(toolbar) = self.toolbar.as_mut() {
+            let mut model = toolbar.model().clone();
+            model.set_active(Some(ButtonId::Pen(index as u8)));
+            if let Err(error) = toolbar.set_model(model) {
+                self.log
+                    .warn(&format!("could not refresh the toolbar: {error}"));
+            }
+        }
+        self.log.info(&format!("pen {index} selected"));
+        // Selecting a pen leaves pointer mode (legacy `btPen_Click`).
+        if self.mode == AppMode::Pointer {
+            self.handle_command(Command::Pointer);
+        }
+    }
+
+    fn ink_undo(&mut self) {
+        let result = self.ink.as_mut().map(|session| session.undo());
+        match result {
+            Some(Ok(())) => self.log.info("ink undone"),
+            Some(Err(error)) => self.log.warn(&format!("undo failed: {error}")),
+            None => {}
+        }
+        self.log_ink_error();
+    }
+
+    fn ink_clear(&mut self) {
+        let result = self.ink.as_mut().map(|session| session.clear());
+        match result {
+            Some(Ok(())) => self.log.info("ink cleared"),
+            Some(Err(error)) => self.log.warn(&format!("clear failed: {error}")),
+            None => {}
+        }
+        self.log_ink_error();
+    }
+
+    /// Toolbar click delivered asynchronously by the toolbar window.
+    fn on_toolbar_click(&mut self, code: usize) {
+        let Some(button) = ButtonId::from_code(code as u32) else {
+            self.log
+                .warn(&format!("unknown toolbar button code {code}"));
+            return;
+        };
+        self.log.info(&format!("toolbar click: {button:?}"));
+        match button {
+            ButtonId::Pen(index) => self.select_pen(usize::from(index)),
+            ButtonId::Undo => self.ink_undo(),
+            ButtonId::Clear => self.ink_clear(),
+            ButtonId::Exit => self.exit_annotation("toolbar exit button"),
+            ButtonId::Pointer => self.handle_command(Command::Pointer),
+            // The dock slide is handled inside the toolbar window itself.
+            ButtonId::Dock => {}
+            other => self.log.info(&format!(
+                "toolbar button {other:?} is not wired in the drawing MVP (Task 8)"
+            )),
+        }
+        self.log_ink_error();
+    }
+
+    /// Surfaces deferred drawing errors (the input hook cannot log directly
+    /// because it runs while the shell is not borrowed).
+    fn log_ink_error(&mut self) {
+        if let Some(message) = self.ink.as_mut().and_then(|session| session.take_error()) {
+            self.log.warn(&format!("drawing session: {message}"));
+        }
     }
 
     fn request_exit(&mut self, reason: &str) {
@@ -795,6 +1535,24 @@ impl Shell {
             self.log
                 .info(&format!("{released} global hotkey(s) unregistered"));
         }
+        if let Some(mut ink) = self.ink.take() {
+            if let Err(error) = ink.cancel_active() {
+                self.log
+                    .warn(&format!("could not cancel the live stroke: {error}"));
+            }
+            if let Some(surface) = ink.surface() {
+                surface.hide();
+            }
+            drop(ink);
+            self.log.info("ink surface released");
+        }
+        if let Some(mut toolbar) = self.toolbar.take() {
+            let _ = toolbar.fast_exit();
+            let _ = toolbar.settle_now();
+            drop(toolbar);
+            self.log.info("toolbar released");
+        }
+        self.gfx = None;
         if let Some(mut window) = self.window.take() {
             window.destroy();
         }
@@ -834,6 +1592,12 @@ unsafe extern "system" fn shell_window_proc(
         IO_RESULT_MESSAGE => {
             unsafe {
                 with_shell(hwnd, |shell| shell.on_io_result(wparam.0 as u64));
+            }
+            LRESULT(0)
+        }
+        TOOLBAR_CLICK_MESSAGE => {
+            unsafe {
+                with_shell(hwnd, |shell| shell.on_toolbar_click(wparam.0));
             }
             LRESULT(0)
         }
