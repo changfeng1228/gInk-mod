@@ -10,6 +10,7 @@ pub mod app;
 pub mod error;
 pub mod gfx;
 pub mod hotkeys;
+pub mod ink;
 pub mod platform;
 pub mod settings;
 pub mod settings_store;
