@@ -75,6 +75,29 @@ impl PenStyle {
         Self::new(color, width, true)
     }
 
+    /// Builds a style from the legacy Microsoft.Ink HIMETRIC width (0.01 mm).
+    ///
+    /// `pen.width` and the pen-width slider stay in HIMETRIC; only rendering
+    /// converts to physical pixels with `width * dpi / 2540`. Configured legacy
+    /// widths are clamped to 30–3000 HIMETRIC before conversion; the resulting
+    /// physical width is then sanitized by `new`.
+    pub fn himetric(color: Rgba8, width: f32, dpi: f32, pressure_enabled: bool) -> Self {
+        const MIN_WIDTH_HIMETRIC: f32 = 30.0;
+        const MAX_WIDTH_HIMETRIC: f32 = 3000.0;
+        const HIMETRIC_PER_INCH: f32 = 2540.0;
+        let width = if width.is_finite() {
+            width.clamp(MIN_WIDTH_HIMETRIC, MAX_WIDTH_HIMETRIC)
+        } else {
+            DEFAULT_STROKE_WIDTH
+        };
+        let dpi = if dpi.is_finite() && dpi > 0.0 {
+            dpi
+        } else {
+            96.0
+        };
+        Self::new(color, width * dpi / HIMETRIC_PER_INCH, pressure_enabled)
+    }
+
     /// Legacy `Transparency >= 100` (`Alpha <= 155`) highlighter rule.
     pub fn is_highlighter(&self) -> bool {
         self.color.a <= HIGHLIGHTER_MAX_ALPHA

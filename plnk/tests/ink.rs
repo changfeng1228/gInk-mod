@@ -653,3 +653,96 @@ fn thousand_mixed_strokes_have_finite_geometry_and_bounded_dirty_regions() {
         history_copy_bytes as f64 / 1024.0,
     );
 }
+
+#[test]
+fn legacy_himetric_pen_width_converts_to_physical_pixels() {
+    let settings = plnk::settings::Settings::defaults();
+    for (dpi, expected) in [
+        (96.0, 3.023_622),
+        (120.0, 3.779_527_7),
+        (144.0, 4.535_433),
+        (192.0, 6.047_244),
+    ] {
+        let style = plnk::app::pen_style_for_dpi(&settings.pens[1], dpi);
+        assert!(
+            (style.width - expected).abs() < 1e-4,
+            "width 80 HIMETRIC at {dpi} DPI must be {expected} physical px, got {}",
+            style.width
+        );
+        assert_eq!(style.color.a, settings.pens[1].alpha);
+    }
+    let highlighter = plnk::app::pen_style_for_dpi(&settings.pens[5], 144.0);
+    assert!((highlighter.width - 28.346_457).abs() < 1e-4);
+    let mut thin = settings.pens[1];
+    thin.width = 30;
+    assert!((plnk::app::pen_style_for_dpi(&thin, 96.0).width - 1.133_858_3).abs() < 1e-4);
+}
+
+#[test]
+fn fast_flicks_are_densely_sampled_instead_of_faceted() {
+    let mut stroke = Stroke::new(opaque_style(8.0));
+    for (x, y) in [(0.0, 0.0), (140.0, 180.0), (280.0, 0.0)] {
+        stroke.push(point_at(x, y, 0));
+    }
+    let samples = stroke.smoothed_samples();
+    assert!(
+        samples.len() >= 60,
+        "a fast 280px flick must not be capped at 12 samples per curve (got {})",
+        samples.len()
+    );
+    let curve_gap = samples[1..samples.len() - 1]
+        .windows(2)
+        .map(|pair| pair[0].position.distance(pair[1].position))
+        .fold(0.0f32, f32::max);
+    assert!(
+        curve_gap <= 4.0,
+        "fast curved segments must stay near the 3px target spacing, not the old >6px faceting (max {curve_gap})"
+    );
+}
+
+#[test]
+fn quadratic_width_interpolation_keeps_pressure_spikes() {
+    let mut stroke = Stroke::new(PenStyle::pressure(Rgba8::new(0, 0, 0, 255), 100.0));
+    for (x, y, pressure) in [(0.0, 0.0, 0.0), (100.0, 100.0, 1.0), (200.0, 0.0, 0.0)] {
+        stroke.push(PenPoint::new(
+            PhysicalPointF::new(x, y),
+            pressure,
+            Duration::ZERO,
+        ));
+    }
+    let samples = stroke.smoothed_samples();
+    let max_width = samples
+        .iter()
+        .map(|sample| sample.width)
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_width > 75.0,
+        "quadratic width must use the control sample's pressure (max {max_width})"
+    );
+}
+
+#[test]
+fn incremental_samples_cover_only_new_geometry_and_match_full_tail() {
+    let style = PenStyle::pressure(Rgba8::new(0, 0, 0, 255), 40.0);
+    let points: Vec<PenPoint> = (0..10)
+        .map(|index| {
+            PenPoint::new(
+                PhysicalPointF::new(index as f32 * 30.0, (index % 3) as f32 * 25.0),
+                (index % 4) as f32 / 3.0,
+                Duration::from_millis(index),
+            )
+        })
+        .collect();
+    let full = plnk::ink::geometry::smooth_samples(&points, &style);
+    let incremental = plnk::ink::geometry::smooth_samples_increment(&points, &style, 4);
+    assert_eq!(incremental.last(), full.last());
+    assert_eq!(
+        incremental.first().map(|sample| sample.position),
+        Some(PhysicalPointF::new(75.0, 25.0)),
+        "the tail must start exactly where the previously rendered curve ended"
+    );
+    assert!(incremental.len() < full.len());
+    for sample in incremental {
+        assert_finite_sample(&sample);
+    }
+}

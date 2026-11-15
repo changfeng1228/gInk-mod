@@ -331,15 +331,15 @@ fn pointer_timestamp_to_submit_is_monotonic() {
             "frame {frame}: normalized timestamps must be monotonic"
         );
 
-        if !started {
-            controller.begin(points[0]);
-            controller.append(&points[1..]);
+        let dirty = if !started {
             started = true;
+            let mut dirty = controller.begin(points[0]);
+            dirty.union(&controller.append(&points[1..]));
+            dirty
         } else {
-            controller.append(&points);
-        }
+            controller.append(&points)
+        };
         let active = controller.active().expect("active stroke");
-        let dirty = DirtyRegion::from_rect(active.bounds());
         surface.draw_active(active, &dirty).expect("draw active");
         surface.present(dirty).expect("present");
         let submit = MonotonicClock::now();
@@ -1031,16 +1031,16 @@ fn ink_mvp_probe() {
         ];
         let wall_start = Instant::now();
         let points = normalizer.normalize(&burst);
-        if !active {
-            controller.begin(points[0]);
-            controller.append(&points[1..]);
+        let dirty = if !active {
+            let mut dirty = controller.begin(points[0]);
+            dirty.union(&controller.append(&points[1..]));
             active = true;
             stroke_messages = 0;
+            dirty
         } else {
-            controller.append(&points);
-        }
+            controller.append(&points)
+        };
         let active_stroke = controller.active().expect("probe active stroke");
-        let dirty = DirtyRegion::from_rect(active_stroke.bounds());
         surface
             .draw_active(active_stroke, &dirty)
             .expect("probe draw");

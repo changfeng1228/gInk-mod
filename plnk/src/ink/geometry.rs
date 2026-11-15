@@ -23,10 +23,12 @@ use crate::ink::model::{PenPoint, PenStyle};
 pub const MAX_COORDINATE: f32 = 1_000_000.0;
 
 /// Target spacing between smoothed polyline samples, in physical pixels.
-const SAMPLE_SPACING: f32 = 6.0;
+/// Fast flicks need sub-3px spacing; the old 6px target visibly faceted them.
+const SAMPLE_SPACING: f32 = 3.0;
 
-/// Hard cap on samples emitted for one raw segment.
-const MAX_SAMPLES_PER_SEGMENT: usize = 12;
+/// Hard cap on samples emitted for one raw segment. This bounds pathological
+/// input without flattening ordinary fast curves (the old cap was 12).
+const MAX_SAMPLES_PER_SEGMENT: usize = 64;
 
 /// Extra pixels added to dirty/bounds rects for antialiasing and rounding.
 const DIRTY_MARGIN: f32 = 1.0;
@@ -134,6 +136,41 @@ pub fn smooth_samples(points: &[PenPoint], style: &PenStyle) -> Vec<StrokeSample
     out
 }
 
+/// Builds only the geometry that was not present in the previous active-layer
+/// draw. `rendered_points` is the raw-point count already on screen.
+///
+/// The previously rendered curve ended at `mid(p[k-2], p[k-1])` (for `k` raw
+/// points). New samples start at that exact midpoint, so the incremental tail
+/// joins the cached curve without a gap and never re-tessellates the whole
+/// active stroke. Batches of coalesced points emit every new quadratic.
+pub fn smooth_samples_increment(
+    points: &[PenPoint],
+    style: &PenStyle,
+    rendered_points: usize,
+) -> Vec<StrokeSample> {
+    if points.len() < 3 || rendered_points < 2 || rendered_points >= points.len() {
+        return smooth_samples(points, style);
+    }
+    let first_control = rendered_points - 1;
+    let last_control = points.len() - 2;
+    let mut out = Vec::new();
+    for index in first_control..=last_control {
+        emit_quadratic(
+            midpoint(&points[index - 1], &points[index], style),
+            sample(&points[index], style),
+            midpoint(&points[index], &points[index + 1], style),
+            &mut out,
+        );
+    }
+    let last = points.len() - 1;
+    emit_line(
+        midpoint(&points[last - 1], &points[last], style),
+        sample(&points[last], style),
+        &mut out,
+    );
+    out
+}
+
 fn emit_line(start: StrokeSample, end: StrokeSample, out: &mut Vec<StrokeSample>) {
     push_if_changed(out, start);
     push_if_changed(out, end);
@@ -150,7 +187,9 @@ fn emit_quadratic(
     for step in 1..=count {
         let t = step as f32 / count as f32;
         let position = quadratic(start.position, control.position, end.position, t);
-        let width = start.width + (end.width - start.width) * t;
+        let inverse = 1.0 - t;
+        let width =
+            inverse * inverse * start.width + 2.0 * inverse * t * control.width + t * t * end.width;
         push_if_changed(out, StrokeSample { position, width });
     }
 }

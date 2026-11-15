@@ -73,6 +73,12 @@ pub struct InkSurface {
     window: OverlayWindow,
     origin: PhysicalPointF,
     size: (u32, u32),
+    /// Color applied once at composition time. The active bitmap is an opacity
+    /// mask, so overlapping incremental pieces cannot darken a highlighter.
+    active_color: crate::gfx::Rgba8,
+    /// Raw points already rendered into `active_target`; only the new tail is
+    /// smoothed and tessellated on the next pointer message.
+    active_rendered_points: usize,
     painted_area: u64,
     last_present: PresentStats,
 }
@@ -118,6 +124,8 @@ impl InkSurface {
             window,
             origin: PhysicalPointF::new(bounds.left as f32, bounds.top as f32),
             size,
+            active_color: crate::gfx::Rgba8::new(0, 0, 0, 0),
+            active_rendered_points: 0,
             painted_area: 0,
             last_present: PresentStats::default(),
         })
@@ -226,9 +234,22 @@ impl InkSurface {
         )
     }
 
-    /// Redraws the active stroke inside `region` on the active layer (the
-    /// region is cleared first, so the smoothing update never leaves ghosts).
+    /// Redraws only the new active-stroke tail inside `region` on the active
+    /// layer (the region is cleared first). The layer is an opaque RGB cache; its
+    /// actual color/alpha is applied once in `present`, so incremental pieces
+    /// cannot create translucent overlap seams.
     pub fn draw_active(&mut self, stroke: &Stroke, region: &DirtyRegion) -> Result<(), GfxError> {
+        let previous = self.active_rendered_points;
+        let full_redraw =
+            previous == 0 || stroke.len() < previous || region.contains_rect(stroke.bounds());
+        let rendered = if full_redraw { 0 } else { previous };
+        let samples = crate::ink::geometry::smooth_samples_increment(
+            stroke.points(),
+            stroke.style(),
+            rendered,
+        );
+        self.active_color = stroke.style().color;
+        let active_color = self.active_color;
         let Self {
             active_context,
             factory,
@@ -237,7 +258,7 @@ impl InkSurface {
             ..
         } = self;
         let origin = *origin;
-        rasterize(
+        let result = rasterize(
             active_context,
             factory,
             origin,
@@ -246,13 +267,21 @@ impl InkSurface {
             true,
             |context, factory, _clip| {
                 let mut renderer = StrokeRenderer::new(context, factory, origin);
-                renderer.draw(stroke)
+                let opaque = crate::gfx::Rgba8 {
+                    a: 255,
+                    ..active_color
+                };
+                renderer.draw_samples(&samples, opaque)
             },
-        )
+        );
+        self.active_rendered_points = if result.is_ok() { stroke.len() } else { 0 };
+        result
     }
 
     /// Clears the active layer inside `region` (cancel/leave/commit path).
     pub fn clear_active(&mut self, region: &DirtyRegion) -> Result<(), GfxError> {
+        self.active_color = crate::gfx::Rgba8::new(0, 0, 0, 0);
+        self.active_rendered_points = 0;
         let Self {
             active_context,
             factory,
@@ -297,6 +326,7 @@ impl InkSurface {
         };
         let static_target = &self.static_target;
         let active_target = &self.active_target;
+        let active_color = self.active_color;
         let window = &mut self.window;
         window.composition_mut().draw(|context, _factory| {
             // Fill and draw primitives on a D2D device context are void; any
@@ -311,14 +341,18 @@ impl InkSurface {
                     None,
                     None,
                 );
-                context.DrawBitmap(
-                    active_target,
-                    Some(&destination as *const D2D_RECT_F),
-                    1.0,
-                    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-                    None,
-                    None,
-                );
+                if active_color.a != 0 {
+                    // RGB is opaque in the active cache; alpha is applied once
+                    // here, so incremental overlap cannot darken highlighters.
+                    context.DrawBitmap(
+                        active_target,
+                        Some(&destination as *const D2D_RECT_F),
+                        f32::from(active_color.a) / 255.0,
+                        D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                        None,
+                        None,
+                    );
+                }
             }
             Ok(())
         })?;

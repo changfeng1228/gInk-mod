@@ -1033,11 +1033,25 @@ unsafe fn session_hook(
     handled.then_some(LRESULT(0))
 }
 
-fn pen_style(pen: &PenSettings) -> PenStyle {
-    PenStyle::fixed(
+/// Converts a configured legacy pen width from HIMETRIC to physical pixels.
+///
+/// Microsoft.Ink `DrawingAttributes.Width` is 0.01 mm, not a pixel count.
+/// Settings and the width slider stay in legacy HIMETRIC units; only rendering
+/// converts them (80 -> 4.54 physical px at 144 DPI).
+pub fn pen_style_for_dpi(pen: &PenSettings, dpi: f32) -> PenStyle {
+    PenStyle::himetric(
         Rgba8::new(pen.color.red, pen.color.green, pen.color.blue, pen.alpha),
         f32::from(pen.width),
+        dpi,
+        false,
     )
+}
+
+fn display_dpi(session: &InkSession) -> f32 {
+    session
+        .surface()
+        .map(|surface| crate::platform::dpi::DpiMap::from_window(surface.hwnd()).dpi() as f32)
+        .unwrap_or(96.0)
 }
 
 fn default_pen_index(settings: &Settings) -> usize {
@@ -1335,7 +1349,10 @@ impl Shell {
                     context: "creating the ink overlay",
                     source,
                 })?;
-            session.set_pen_style(pen_style(&self.settings.pens[self.pen_index]));
+            session.set_pen_style(pen_style_for_dpi(
+                &self.settings.pens[self.pen_index],
+                display_dpi(&session),
+            ));
             self.ink = Some(session);
             self.log.info(&format!(
                 "ink overlay created at {}x{} physical pixels",
@@ -1506,7 +1523,10 @@ impl Shell {
         }
         self.pen_index = index;
         if let Some(session) = self.ink.as_mut() {
-            session.set_pen_style(pen_style(&self.settings.pens[index]));
+            session.set_pen_style(pen_style_for_dpi(
+                &self.settings.pens[index],
+                display_dpi(session),
+            ));
         }
         if let Some(toolbar) = self.toolbar.as_mut() {
             let mut model = toolbar.model().clone();
