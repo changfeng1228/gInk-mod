@@ -378,6 +378,21 @@ fn clear_is_undoable_and_clears_redo() {
     let redo = document.redo().expect("clear is redoable");
     assert!(!redo.is_empty());
     assert!(document.is_empty());
+
+    // P-056 / legacy btClear_Click: clear invalidates redo even when the
+    // canvas is already empty.
+    assert!(document.undo().is_some());
+    assert!(document.undo().is_some());
+    assert!(document.is_empty());
+    assert_eq!(document.redo_depth(), 2);
+    let empty_clear = document.apply(Edit::Clear);
+    assert!(empty_clear.is_empty());
+    assert_eq!(
+        document.redo_depth(),
+        0,
+        "empty clear still invalidates redo"
+    );
+    assert!(document.redo().is_none());
 }
 
 #[test]

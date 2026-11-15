@@ -314,6 +314,10 @@ impl InkDocument {
 
     fn clear(&mut self) -> DirtyRegion {
         if self.strokes.is_empty() {
+            // P-056: clear invalidates redo even when the canvas is already
+            // empty. Legacy `btClear_Click` always calls `SaveUndoStrokes`,
+            // which sets `RedoDepth = 0` before doing anything else.
+            self.history.discard_redo();
             return DirtyRegion::new();
         }
         let removed: Vec<RemovedStroke> = self
