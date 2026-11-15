@@ -17,6 +17,14 @@ pub enum SettingsError {
     /// The new settings file could not be written. The path is shown to the
     /// user.
     Write { path: PathBuf, source: io::Error },
+    /// Neither the portable settings directory nor the `%LOCALAPPDATA%`
+    /// fallback could be created or written. Both candidate paths are shown to
+    /// the user.
+    StorageUnavailable {
+        portable: PathBuf,
+        fallback: PathBuf,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for SettingsError {
@@ -28,6 +36,16 @@ impl fmt::Display for SettingsError {
             Self::Write { path, source } => {
                 write!(formatter, "failed to write {}: {source}", path.display())
             }
+            Self::StorageUnavailable {
+                portable,
+                fallback,
+                source,
+            } => write!(
+                formatter,
+                "failed to create a writable settings directory (tried {} then {}): {source}",
+                portable.display(),
+                fallback.display()
+            ),
         }
     }
 }
@@ -35,7 +53,9 @@ impl fmt::Display for SettingsError {
 impl std::error::Error for SettingsError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read { source, .. } | Self::Write { source, .. } => Some(source),
+            Self::Read { source, .. }
+            | Self::Write { source, .. }
+            | Self::StorageUnavailable { source, .. } => Some(source),
         }
     }
 }

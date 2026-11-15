@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use plnk::settings::{CloseOnSnap, Hotkey, Rgb, Settings};
-use plnk::settings_store::SettingsStore;
+use plnk::settings_store::{SettingsStore, StorageRoots};
 
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy")
@@ -27,10 +27,11 @@ fn temp_dir(label: &str) -> PathBuf {
 }
 
 /// Builds a store that imports from `fixture_dir` and would save to a fresh
-/// temporary path, never to the fixture directory.
+/// temporary storage root, never to the fixture directory.
 fn store_for(fixture_dir: &Path, label: &str) -> SettingsStore {
-    let settings_path = temp_dir(label).join("settings.ini");
-    SettingsStore::new(settings_path, vec![fixture_dir.to_path_buf()])
+    let base = temp_dir(label);
+    let storage = StorageRoots::new(base.join("data"), base.join("local-app-data").join("plnk"));
+    SettingsStore::new(storage, vec![fixture_dir.to_path_buf()])
 }
 
 fn snapshot_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -247,8 +248,13 @@ fn comments_and_unknown_lines_survive_save() {
     let dir = fixture("malformed/syntax");
     let before = snapshot_dir(&dir);
     let temp = temp_dir("syntax-save");
-    let settings_path = temp.join("settings.ini");
-    let mut store = SettingsStore::new(settings_path.clone(), vec![dir.clone()]);
+    let portable = temp.join("data");
+    let fallback = temp.join("local-app-data").join("plnk");
+    let settings_path = portable.join("settings.ini");
+    let mut store = SettingsStore::new(
+        StorageRoots::new(portable, fallback.clone()),
+        vec![dir.clone()],
+    );
 
     let mut import = store.load_or_import().unwrap();
     assert!(
@@ -269,6 +275,10 @@ fn comments_and_unknown_lines_survive_save() {
         snapshot_dir(&dir),
         before,
         "save must not write legacy files"
+    );
+    assert!(
+        !fallback.exists(),
+        "the writable portable root must be preferred over the fallback"
     );
 
     let saved = fs::read_to_string(&settings_path).unwrap();
@@ -502,13 +512,19 @@ fn legacy_lookup_prefers_the_first_search_directory() {
     fs::write(second.join("config.ini"), "Toolbar_Top = 22\n").unwrap();
 
     let mut store = SettingsStore::new(
-        temp_dir("lookup-store-a").join("settings.ini"),
+        StorageRoots::new(
+            temp_dir("lookup-store-a").join("data"),
+            temp_dir("lookup-store-a-fallback").join("plnk"),
+        ),
         vec![first.clone(), second.clone()],
     );
     assert_eq!(store.load_or_import().unwrap().settings.toolbar_top, 11);
 
     let mut reversed = SettingsStore::new(
-        temp_dir("lookup-store-b").join("settings.ini"),
+        StorageRoots::new(
+            temp_dir("lookup-store-b").join("data"),
+            temp_dir("lookup-store-b-fallback").join("plnk"),
+        ),
         vec![second, first],
     );
     assert_eq!(reversed.load_or_import().unwrap().settings.toolbar_top, 22);
@@ -517,10 +533,15 @@ fn legacy_lookup_prefers_the_first_search_directory() {
 #[test]
 fn existing_settings_file_takes_precedence_over_legacy_import() {
     let dir = temp_dir("settings-precedence");
-    let settings_path = dir.join("settings.ini");
+    let portable = dir.join("data");
+    fs::create_dir_all(&portable).unwrap();
+    let settings_path = portable.join("settings.ini");
     fs::write(&settings_path, "Language_File = de\nToolbar_Top = 5\n").unwrap();
 
-    let mut store = SettingsStore::new(settings_path, vec![fixture("default")]);
+    let mut store = SettingsStore::new(
+        StorageRoots::new(portable, dir.join("local-app-data").join("plnk")),
+        vec![fixture("default")],
+    );
     let import = store.load_or_import().unwrap();
     assert!(import.warnings.is_empty());
     assert_eq!(import.settings.language_file, "de");
@@ -533,9 +554,11 @@ fn existing_settings_file_takes_precedence_over_legacy_import() {
 #[test]
 fn saving_a_fresh_install_writes_a_reloadable_document() {
     let dir = temp_dir("fresh-save");
-    let settings_path = dir.join("data").join("settings.ini");
+    let portable = dir.join("data");
+    let fallback = dir.join("local-app-data").join("plnk");
+    let settings_path = portable.join("settings.ini");
     let mut store = SettingsStore::new(
-        settings_path.clone(),
+        StorageRoots::new(portable, fallback.clone()),
         vec![fixture("malformed/missing-file")],
     );
 
@@ -547,9 +570,64 @@ fn saving_a_fresh_install_writes_a_reloadable_document() {
         settings_path.is_file(),
         "save must create the data directory"
     );
+    assert!(
+        !fallback.exists(),
+        "the writable portable root must be preferred over the fallback"
+    );
     let reloaded = store.load_or_import().unwrap();
     assert_eq!(reloaded.settings, Settings::defaults());
     assert!(reloaded.warnings.is_empty());
+}
+
+#[test]
+fn unwritable_portable_storage_falls_back_to_local_app_data() {
+    let dir = temp_dir("storage-fallback");
+    // A regular file where the exe-adjacent directory would be makes
+    // create_dir_all fail deterministically on Windows.
+    let blocker = dir.join("blocked-exe-dir");
+    fs::write(&blocker, b"not a directory").unwrap();
+    let portable = blocker.join("data");
+    let fallback = dir.join("local-app-data").join("plnk");
+    let mut store = SettingsStore::new(
+        StorageRoots::new(portable.clone(), fallback.clone()),
+        vec![fixture("default")],
+    );
+
+    let import = store.load_or_import().unwrap();
+    assert_eq!(import.settings.language_file, "en-us");
+
+    // The resolved root is cached: even after the portable path would become
+    // usable, save must stay on the fallback root chosen at load time.
+    fs::remove_file(&blocker).unwrap();
+    store.save(&import.settings).unwrap();
+
+    assert!(
+        fallback.join("settings.ini").is_file(),
+        "save must use the fallback root"
+    );
+    assert!(!portable.exists(), "the portable root must not be used");
+
+    let reloaded = store.load_or_import().unwrap();
+    assert_eq!(reloaded.settings, import.settings);
+    assert!(reloaded.warnings.is_empty());
+}
+
+#[test]
+fn unwritable_storage_reports_both_candidate_roots() {
+    let dir = temp_dir("storage-unavailable");
+    let portable_blocker = dir.join("portable-blocker");
+    let fallback_blocker = dir.join("fallback-blocker");
+    fs::write(&portable_blocker, b"file").unwrap();
+    fs::write(&fallback_blocker, b"file").unwrap();
+    let mut store = SettingsStore::new(
+        StorageRoots::new(portable_blocker.join("data"), fallback_blocker.join("plnk")),
+        Vec::new(),
+    );
+
+    let error = store.load_or_import().unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("portable-blocker"), "error was: {message}");
+    assert!(message.contains("fallback-blocker"), "error was: {message}");
 }
 
 struct FailingReader;
