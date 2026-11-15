@@ -216,11 +216,17 @@ impl ToolbarWindow {
         Ok(())
     }
 
-    /// Animates the visual from its current offset to `target`.
+    /// Animates the visual from the last requested offset to `target`.
     ///
     /// Only start, end, duration and easing are handed to DirectComposition;
     /// DWM evaluates the curve on its composition cadence. This call returns
     /// immediately and the application receives no per-frame callbacks.
+    ///
+    /// This raw primitive intentionally keeps no animation clock: a second call
+    /// starts from the previously requested target, not from where the visual
+    /// currently is. The product toolbar (`ui::toolbar::ToolbarWindow`) layers
+    /// [`crate::ui::animation::ToolbarAnimator`] on top to retarget from the
+    /// live visual position.
     pub fn animate_to(
         &mut self,
         target: PhysicalPoint,
@@ -238,16 +244,48 @@ impl ToolbarWindow {
     }
 }
 
+/// A window-procedure hook installed by a higher layer (the toolbar UI).
+///
+/// The hook is called for every message after the shared callback counters
+/// were updated, except `WM_NCCREATE`/`WM_NCDESTROY` (the window back-pointer
+/// is not installed yet / has already been cleared). Returning `Some` takes
+/// over the message; `None` continues with the default handling.
+///
+/// # Safety
+/// `data` is the pointer registered by the window creator. It must stay valid
+/// for as long as the HWND exists; the window clears the hook before the HWND
+/// is destroyed.
+pub(crate) type WindowHook =
+    unsafe fn(*mut core::ffi::c_void, HWND, u32, WPARAM, LPARAM) -> Option<LRESULT>;
+
+struct WindowContext {
+    counters: WindowCounters,
+    hook: Option<WindowHook>,
+    hook_data: *mut core::ffi::c_void,
+}
+
 /// Common top-level window plumbing: class registration, creation, extended
 /// style management, destruction and the acceptance-test counters.
-struct NativeWindow {
+pub(crate) struct NativeWindow {
     hwnd: HWND,
-    counters: std::sync::Arc<WindowCounters>,
+    // Boxed so the pointer stored in GWLP_USERDATA stays valid when the window
+    // object itself is moved (constructors return it by value).
+    context: Box<WindowContext>,
     _not_send: PhantomData<Rc<()>>,
 }
 
 impl NativeWindow {
     fn create(bounds: PhysicalRect, title: PCWSTR, layered: bool) -> Result<Self, GfxError> {
+        Self::create_with_hook(bounds, title, layered, None, std::ptr::null_mut())
+    }
+
+    pub(crate) fn create_with_hook(
+        bounds: PhysicalRect,
+        title: PCWSTR,
+        layered: bool,
+        hook: Option<WindowHook>,
+        hook_data: *mut core::ffi::c_void,
+    ) -> Result<Self, GfxError> {
         ensure_process_dpi_awareness()?;
         if bounds.width() <= 0 || bounds.height() <= 0 {
             return Err(GfxError::ZeroSize {
@@ -277,11 +315,15 @@ impl NativeWindow {
             }
         }
 
-        let counters = std::sync::Arc::new(WindowCounters::default());
-        // Stored in GWLP_USERDATA for the window procedure. The Arc keeps the
-        // counters alive for at least as long as the HWND (destroy runs in
-        // `destroy`/Drop before the Arc field is dropped).
-        let counters_pointer = std::sync::Arc::as_ptr(&counters) as *const core::ffi::c_void;
+        let context = Box::new(WindowContext {
+            counters: WindowCounters::default(),
+            hook,
+            hook_data,
+        });
+        // Stored in GWLP_USERDATA for the window procedure. The Box keeps the
+        // context alive for at least as long as the HWND (destruction runs in
+        // `destroy`/Drop, which also clears the hook, before the Box drops).
+        let context_pointer = context.as_ref() as *const WindowContext as *const core::ffi::c_void;
         let mut style =
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP;
         if layered {
@@ -305,7 +347,7 @@ impl NativeWindow {
                 None,
                 None,
                 Some(HINSTANCE(instance.0)),
-                Some(counters_pointer),
+                Some(context_pointer),
             )
         }
         .map_err(failed("CreateWindowExW"))?;
@@ -321,17 +363,17 @@ impl NativeWindow {
 
         Ok(Self {
             hwnd,
-            counters,
+            context,
             _not_send: PhantomData,
         })
     }
 
-    fn hwnd(&self) -> HWND {
+    pub(crate) fn hwnd(&self) -> HWND {
         self.hwnd
     }
 
-    fn callback_counts(&self) -> CallbackCounts {
-        self.counters.snapshot()
+    pub(crate) fn callback_counts(&self) -> CallbackCounts {
+        self.context.counters.snapshot()
     }
 
     fn show(&self) {
@@ -340,7 +382,7 @@ impl NativeWindow {
         }
     }
 
-    fn window_rect(&self) -> Result<PhysicalRect, GfxError> {
+    pub(crate) fn window_rect(&self) -> Result<PhysicalRect, GfxError> {
         let mut rect = RECT::default();
         unsafe { GetWindowRect(self.hwnd, &mut rect) }.map_err(failed("GetWindowRect"))?;
         Ok(PhysicalRect::new(
@@ -388,6 +430,8 @@ impl NativeWindow {
     }
 
     fn destroy(&mut self) {
+        self.context.hook = None;
+        self.context.hook_data = std::ptr::null_mut();
         if !self.hwnd.is_invalid() {
             let _ = unsafe { DestroyWindow(self.hwnd) };
             self.hwnd = HWND::default();
@@ -431,14 +475,14 @@ fn ensure_process_dpi_awareness() -> Result<(), GfxError> {
     })
 }
 
-fn counters(hwnd: HWND) -> Option<&'static WindowCounters> {
-    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowCounters;
+fn context(hwnd: HWND) -> Option<&'static WindowContext> {
+    let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const WindowContext;
     if pointer.is_null() {
         None
     } else {
-        // SAFETY: the pointer is installed in WM_NCCREATE from the Arc kept
+        // SAFETY: the pointer is installed in WM_NCCREATE from the Box kept
         // alive by NativeWindow and cleared in WM_NCDESTROY, so any message
-        // dispatched to this HWND sees a live WindowCounters.
+        // dispatched to this HWND sees a live WindowContext.
         Some(unsafe { &*pointer })
     }
 }
@@ -449,20 +493,53 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    match message {
-        WM_NCCREATE => {
-            let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
-        WM_NCDESTROY => {
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
-        WM_PAINT => {
-            if let Some(counters) = counters(hwnd) {
-                counters.paint.fetch_add(1, Ordering::Relaxed);
+    if message == WM_NCCREATE {
+        let create = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize) };
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+    if message == WM_NCDESTROY {
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+    }
+
+    let context = context(hwnd);
+    if let Some(context) = context {
+        match message {
+            WM_PAINT => {
+                context.counters.paint.fetch_add(1, Ordering::Relaxed);
+                let mut paint = PAINTSTRUCT::default();
+                unsafe {
+                    BeginPaint(hwnd, &mut paint);
+                    let _ = EndPaint(hwnd, &paint);
+                }
+                return LRESULT(0);
             }
+            WM_ERASEBKGND => return LRESULT(1),
+            WM_TIMER => {
+                context.counters.timer.fetch_add(1, Ordering::Relaxed);
+            }
+            WM_MOUSEMOVE => {
+                context.counters.mouse_move.fetch_add(1, Ordering::Relaxed);
+            }
+            message if message == APP_CALLBACK_MESSAGE => {
+                context.counters.custom.fetch_add(1, Ordering::Relaxed);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+        if let Some(hook) = context.hook {
+            // SAFETY: the creator guarantees `hook_data` is valid while the
+            // HWND exists; `destroy` clears the hook before DestroyWindow.
+            if let Some(result) = unsafe { hook(context.hook_data, hwnd, message, wparam, lparam) }
+            {
+                return result;
+            }
+        }
+    }
+
+    match message {
+        WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             unsafe {
                 BeginPaint(hwnd, &mut paint);
@@ -470,25 +547,8 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_TIMER => {
-            if let Some(counters) = counters(hwnd) {
-                counters.timer.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
-        WM_MOUSEMOVE => {
-            if let Some(counters) = counters(hwnd) {
-                counters.mouse_move.fetch_add(1, Ordering::Relaxed);
-            }
-            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
-        }
         WM_ERASEBKGND => LRESULT(1),
-        message if message == APP_CALLBACK_MESSAGE => {
-            if let Some(counters) = counters(hwnd) {
-                counters.custom.fetch_add(1, Ordering::Relaxed);
-            }
-            LRESULT(0)
-        }
+        message if message == APP_CALLBACK_MESSAGE => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }

@@ -96,6 +96,7 @@ pub struct CompositionFrameStats {
 
 /// The single native graphics device of the process (UI-thread owned).
 pub struct GraphicsDevice {
+    d2d_factory: ID2D1Factory1,
     d2d_device: ID2D1Device,
     d3d_device: ID3D11Device,
     dxgi_factory: IDXGIFactory2,
@@ -152,6 +153,7 @@ impl GraphicsDevice {
                 .map_err(failed("DCompositionCreateDevice2"))?;
 
         Ok(Self {
+            d2d_factory,
             d2d_device,
             d3d_device,
             dxgi_factory,
@@ -167,6 +169,12 @@ impl GraphicsDevice {
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)
         }
         .map_err(failed("ID2D1Device::CreateDeviceContext"))
+    }
+
+    /// The Direct2D factory, shared by the drawing code that needs path
+    /// geometries and stroke styles (toolbar icons).
+    pub(crate) fn factory(&self) -> &ID2D1Factory1 {
+        &self.d2d_factory
     }
 
     pub(crate) fn create_swap_chain(
