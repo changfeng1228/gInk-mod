@@ -57,9 +57,9 @@ use crate::platform::cursor::{CanvasCursors, default_class_cursor};
 use crate::platform::dpi::PhysicalRect;
 use crate::platform::window::{MonotonicClock, current_monitor_rect, ensure_process_dpi_awareness};
 use crate::settings::{PenSettings, Settings};
-use crate::settings_store::StorageRoots;
+use crate::settings_store::{SettingsStore, StorageRoots};
 use crate::telemetry::{LogError, LogSink};
-use crate::tray::{MENU_EXIT, TrayError, TrayIcon};
+use crate::tray::{MENU_EXIT, MENU_OPTIONS, TrayError, TrayIcon};
 use crate::ui::pen_width::{DEFAULT_WIDTH_HIMETRIC, PenWidthPanel};
 use crate::ui::toolbar::{ButtonId, ToolbarWindow as ToolbarUiWindow, pen_width_visible};
 
@@ -1838,6 +1838,88 @@ impl Shell {
         }
     }
 
+    /// Opens the settings window (tray menu "Options...").
+    ///
+    /// Only reachable from tray mode: during an annotation session the two
+    /// system-wide hotkeys are registered and the overlay owns the pointer, so a
+    /// modal settings window would fight the drawing session.
+    fn open_options(&mut self) {
+        if !crate::options::can_open_in(self.mode) {
+            self.log.warn(&format!(
+                "options requested while in {:?}; only tray mode may open them",
+                self.mode
+            ));
+            if let Some(tray) = &self.tray {
+                let _ = tray.show_warning("plnk", "请先退出批注（按 Esc），再打开设置。");
+            }
+            return;
+        }
+        match crate::ui::options_window::show(
+            self.window.as_ref().map(|w| w.hwnd()),
+            &self.settings,
+        ) {
+            Ok(Some(updated)) => {
+                // Hotkeys changed: re-register so the new combinations take
+                // effect without a restart, then persist.
+                let changed = updated != self.settings;
+                self.settings = updated;
+                if changed {
+                    self.reregister_hotkeys();
+                    self.save_settings();
+                }
+            }
+            Ok(None) => self.log.info("options cancelled"),
+            Err(error) => self.log.warn(&format!("options window failed: {error}")),
+        }
+    }
+
+    /// Re-registers the global hotkeys after a settings change.
+    fn reregister_hotkeys(&mut self) {
+        if let Some(mut hotkeys) = self.hotkeys.take() {
+            let released = hotkeys.unregister_all();
+            self.log.info(&format!(
+                "{released} hotkey(s) released for re-registration"
+            ));
+        }
+        let map = HotkeyMap::from_settings(&self.settings);
+        let (hotkeys, report) = GlobalHotkeys::register(
+            &map,
+            self.window.as_ref().map(|w| w.hwnd()),
+            !self.options.no_hotkeys,
+        );
+        if !self.options.no_hotkeys {
+            self.log.info(&format!(
+                "re-registered {} global hotkey(s)",
+                report.registered.len()
+            ));
+            for issue in &report.issues {
+                self.log.warn(&format!("hotkey issue: {issue}"));
+            }
+            self.report_hotkey_issues(&report.issues);
+        }
+        self.hotkeys = Some(hotkeys);
+    }
+
+    /// Persists the current settings. Failures are logged, not fatal: the user
+    /// keeps a working session and the next successful save picks up the change.
+    fn save_settings(&mut self) {
+        let mut store = SettingsStore::default();
+        match store.load_or_import() {
+            Ok(_) => {}
+            Err(error) => self
+                .log
+                .warn(&format!("settings reload before save failed: {error}")),
+        }
+        if let Err(error) = store.save(&self.settings) {
+            self.log.warn(&format!("cannot save settings: {error}"));
+            if let Some(tray) = &self.tray {
+                let _ = tray.show_warning("plnk", &format!("设置保存失败：{error}"));
+            }
+        } else {
+            self.log.info("settings saved");
+        }
+    }
+
     fn request_exit(&mut self, reason: &str) {
         if !self.exit_requested {
             self.exit_requested = true;
@@ -1958,10 +2040,14 @@ unsafe extern "system" fn shell_window_proc(
             LRESULT(0)
         }
         WM_COMMAND => {
-            if (wparam.0 & 0xFFFF) == MENU_EXIT {
-                unsafe {
+            match wparam.0 & 0xFFFF {
+                MENU_EXIT => unsafe {
                     with_shell(hwnd, |shell| shell.request_exit("tray menu Exit"));
-                }
+                },
+                MENU_OPTIONS => unsafe {
+                    with_shell(hwnd, |shell| shell.open_options());
+                },
+                _ => {}
             }
             LRESULT(0)
         }

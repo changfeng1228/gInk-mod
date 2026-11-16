@@ -20,13 +20,14 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, HMENU, ICON_BIG,
     ICON_SMALL, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW,
-    LoadImageW, MF_STRING, PostMessageW, SendMessageW, SetForegroundWindow, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_NULL, WM_SETICON,
+    LoadImageW, MF_SEPARATOR, MF_STRING, PostMessageW, SendMessageW, SetForegroundWindow,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL, WM_SETICON,
 };
 use windows::core::{Error as WindowsError, PCWSTR, w};
 
 /// Command id posted by the tray menu. The same id the user selects in the
 /// popup produces the `WM_COMMAND` handled by the shell window.
+pub const MENU_OPTIONS: usize = 2;
 pub const MENU_EXIT: usize = 1;
 
 const TRAY_ICON_ID: u32 = 1;
@@ -138,6 +139,18 @@ impl TrayIcon {
     }
 
     fn run_context_menu(hwnd: HWND, menu: HMENU) -> Result<(), TrayError> {
+        unsafe { AppendMenuW(menu, MF_STRING, MENU_OPTIONS, w!("Options...")) }.map_err(
+            |error| TrayError {
+                context: "adding Options to the tray menu (AppendMenuW)",
+                source: error,
+            },
+        )?;
+        unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) }.map_err(|error| {
+            TrayError {
+                context: "adding a separator to the tray menu (AppendMenuW)",
+                source: error,
+            }
+        })?;
         unsafe { AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Exit")) }.map_err(|error| {
             TrayError {
                 context: "adding Exit to the tray menu (AppendMenuW)",

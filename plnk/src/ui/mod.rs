@@ -3,6 +3,7 @@
 
 pub mod animation;
 pub mod icons;
+pub mod options_window;
 pub mod pen_width;
 pub mod toolbar;
 
