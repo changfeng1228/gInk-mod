@@ -147,17 +147,11 @@ plnk/tests/
 
 ### 5.3 光标热点必须落在笔尖像素上
 
-**这是最容易搞错的一处。** 那批 128×128 的笔形光标**不是满画布**：
+**这是最容易搞错的一处。** 笔形光标 ICO 的不透明像素（alpha > 20 且 AND 掩码位为 0）只占画布的一个角，其余全透明；而热点是位图里**与鼠标坐标对齐的那一个像素**，必须取在笔尖上。设成位图角 (0,0) 之类就落在透明区，整支笔形被画偏，且**不报错**——只是「看起来不对」。
 
-```
-不透明像素范围: x[64,127]  y[0,63]
-即笔尖只在「右上角」四分之一，左下四分之一全透明
-笔尖顶点: y=0 行，x=109~112，中心 110
-```
+**本文件不记录绝对坐标。** 热点数值由 `plnk\src\platform\cursor.rs` 的 `hotspot_tests` 从资产推导并钉住：该模块解码四支笔色 ICO 的像素，按 `biHeight` 符号翻成视觉顺序，取最高一行不透明像素的中位 x 作为笔尖，并断言常量 `PEN_CURSOR_HOTSPOT` 与之相等——资产或常量任改一方，测试就红。真值只在代码里，文档与代码不会再分叉。
 
-所以热点是 **(110, 0)**，不是 (0,0)。设成 (0,0) 等于把热点放在透明角落，笔形会被画在落笔点右边约 110 像素。
-
-改这个值之前，先用第 8 节的方法重新量一遍像素，不要凭感觉调。
+要亲手量一遍像素、或核对 `PEN_CURSOR_HOTSPOT` 与资产是否仍一致，用第 7 节的脚本；不要凭感觉调常量。
 
 ### 5.4 `CreateIconFromResourceEx` 对这批资产不可用
 
@@ -228,25 +222,130 @@ cargo fmt --manifest-path plnk/Cargo.toml --check
 
 ### 改 UI 或光标后必须人工确认
 
-自动化测不了"看起来对不对"。这两件事只能人看：
+自动化测不了"看起来对不对"。这几件事只能人看：
 
 1. 托盘右键 → Options → 应看到热键列表和「开机自启动」复选框
 2. 画一笔 → 笔尖应正好落在光标尖端
+3. **热点的观感部分只能人眼验完**：下面那个量像素的脚本和 `hotspot_tests` 只证明常量等于解码出的笔尖像素，证明不了屏幕上的最终视觉——笔刷缩放、DPI 缩放、主题笔形都能让坐标全对却看着歪。必须真机画一笔，确认笔尖贴住墨迹起点——不是偏出半个笔宽、也不是把墨迹画在光标旁边。
+
+人眼之前先过**数值判据**（不过就别浪费眼睛；过了也不等于验收通过）：
+
+- `偏移 = 写入热点 − 解码尖端 = (0, 0)`，四支笔色全部成立——判定式与脚本见下条"量光标热点的办法"，不成立时脚本 `exit 1`
+- `cargo test --manifest-path plnk/Cargo.toml --lib platform::cursor` 全绿：`hotspot_tests` 用同一套解码断言 `PEN_CURSOR_HOTSPOT == 笔尖`，资产与常量任改一方就红
+- 四支笔色的解码 `apex` 两两差 ≤2 px（脚本输出逐字一致即满足）
 
 ### 量光标热点的办法（复现第 5.3 节）
 
+热点是**位图里的一个像素坐标**，量它就得按 Windows 的读法解那张 DIB。三个坑每一个都能算出一个"看起来很有道理"的错值：
+
+1. **BMP 自下而上存。** `biHeight` 数的是 XOR 位图 + 尾部 AND 掩码两份；XOR 行从**最底一行**开始往上写，`biHeight < 0` 才是自上而下。不显式翻行序，量到的"顶点"是笔尾，热点会偏出约 64 px。
+2. **XOR 行按 4 字节对齐**：每行 `(width*4 + 3) & ~3` 字节，不是 `width*4`；AND 掩码每行 `((width+31)//32)*4` 字节，位序 MSB-first、**位 0 = 不透明**。本资产 `width=128` 正好整除，漏掉对齐也能跑，换个尺寸就整行错位。
+3. **`ICONDIRENTRY` 的字段位置**：`dwImageOffset` 在 +12（绝对偏移 18）。从偏移 10 开始用 `'<HHII'` 解，四个字段全部错位 2 字节，读出来的"热点"是噪声。
+
+把下面这段存成 `measure-cursor-hotspot.py`（放仓库外即可），在仓库根目录跑（Python 3）。它遍历**全部扫描线**，按 `biHeight` 符号决定 bottom-up / top-down，处理「XOR 位图 + AND 掩码」两倍高与行 4 字节对齐，输出 top-down 的 bbox 与笔尖 apex，并算 `偏移 = 写入热点 − 解码尖端`。不带参数时扫 `plnk/assets/icons/cursor*.ico`，也可传文件路径；`--hotspot X,Y` 覆盖它从源码读到的写入值（用来验证脚本自己会不会报错）。
+
 ```python
-import struct
-d = open('plnk/assets/icons/cursorred.ico','rb').read()
-planes,bits,size,off = struct.unpack('<HHII', d[10:22])
-bmp = d[off:off+size]
-hs  = struct.unpack('<I', bmp[:4])[0]
-bw,bh = struct.unpack('<ii', bmp[4:12])
-pix = bmp[hs:]
-row = [x for x in range(bw)
-       if pix[x*4+3] > 20]          # y=0 行，alpha>20
-print(min(row), max(row), sum(row)//len(row))
+import glob, re, struct, sys
+
+ALPHA = 20                      # 与 cursor.rs 的 OPAQUE_ALPHA 一致：alpha>20 才算笔身
+SRC   = 'plnk/src/platform/cursor.rs'
+
+def u16(b, o): return struct.unpack_from('<H', b, o)[0]
+def u32(b, o): return struct.unpack_from('<I', b, o)[0]
+def i32(b, o): return struct.unpack_from('<i', b, o)[0]
+
+def written_hotspot():
+    """读代码里写进 .cur 头的那两个 u16：PEN_CURSOR_HOTSPOT。"""
+    src = open(SRC, encoding='utf-8').read()
+    m = re.search(r'PEN_CURSOR_HOTSPOT\s*:\s*\(\s*u16\s*,\s*u16\s*\)\s*=\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', src)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+def decode(path):
+    """解 32bpp ICO：显式翻 bottom-up、显式按 4 字节对齐行。"""
+    d = open(path, 'rb').read()
+    idtype, count = u16(d, 2), u16(d, 4)                        # 1=ICO 2=CUR
+    off = u32(d, 6 + 16 * (count - 1) + 12)                     # 最后一张的 dwImageOffset
+    bi_size, width, bi_height = u32(d, off), i32(d, off + 4), i32(d, off + 8)
+    bits = u16(d, off + 14)                                     # biBitCount
+    if bits != 32:
+        return None, f"{bits}bpp -- only 32bpp BGRA; skipped"
+    top_down = bi_height < 0                                    # biHeight<0 = 自上而下
+    height = abs(bi_height) // 2 if idtype == 1 else abs(bi_height)  # ICO 含 AND 掩码两倍高
+    stride, mstride = (width * 4 + 3) & ~3, ((width + 31) // 32) * 4  # XOR 行 4 字节 / 掩码行 32 位对齐
+    pix, mask = off + bi_size, off + bi_size + stride * height
+    x0, y0, x1, y1, rows = width, height, -1, -1, {}
+    for file_row in range(height):                              # 遍历全部扫描线
+        y = file_row if top_down else height - 1 - file_row      # 翻成 top-down（左上为原点）
+        for x in range(width):
+            a = d[pix + file_row * stride + x * 4 + 3]          # BGRA 第 4 字节 = alpha
+            m = (d[mask + file_row * mstride + x // 8] >> (7 - x % 8)) & 1
+            if a > ALPHA and m == 0:                            # AND 掩码位 0 = 不透明
+                x0, y0, x1, y1 = min(x0, x), min(y0, y), max(x1, x), max(y1, y)
+                rows.setdefault(y, []).append(x)
+    if not rows:
+        return None, "no opaque pixel"
+    top = min(rows)                                             # 最上面那行不透明像素
+    apex_x = sorted(rows[top])[len(rows[top]) // 2]              # 中位 x，不是左边缘
+    return ((x0, y0, x1, y1), (apex_x, top), (width, height)), None
+
+def main(argv):
+    paths, forced, i = [], None, 0
+    while i < len(argv):
+        if argv[i] == '--hotspot':
+            x, y = argv[i + 1].split(','); forced = (int(x), int(y)); i += 2
+        else:
+            paths.append(argv[i]); i += 1
+    paths = paths or sorted(glob.glob('plnk/assets/icons/cursor*.ico'))
+    written = forced or written_hotspot()
+    bad = 0
+    for path in paths:
+        name = path.replace('\\', '/').rsplit('/', 1)[-1]
+        got, why = decode(path)
+        if got is None:
+            print(f"{name}: {why}")
+            continue
+        bbox, apex, (w, h) = got
+        line = f"{name}: {w}x{h} bbox(left, top, right, bottom)={bbox}  apex={apex}"
+        if written is None:
+            print(line + f"   [written hotspot unknown: pass --hotspot x,y or check {SRC}]")
+            continue
+        delta = (written[0] - apex[0], written[1] - apex[1])
+        ok = delta == (0, 0)
+        bad += 0 if ok else 1
+        print(f"{line}  written={written}  offset=written-decoded={delta}  " + ("OK" if ok else "FAIL"))
+    if written is not None and bad:
+        print(f"{bad} asset(s) with offset != (0, 0)")
+        return 1
+    return 0
+
+sys.exit(main(sys.argv[1:]))
 ```
+
+四支笔色资产在同一份资产上的实测输出（bbox 是 top-down 坐标、含端点，四支笔色逐字相同）：
+
+```
+cursorred.ico: 128x128 bbox(left, top, right, bottom)=(64, 64, 127, 127)  apex=(67, 64)  written=(67, 64)  offset=written-decoded=(0, 0)  OK
+cursorsnap.ico: 8bpp -- only 32bpp BGRA; skipped
+```
+
+先确认脚本真会报错（别只信绿灯）：
+
+```bash
+python measure-cursor-hotspot.py --hotspot 0,0
+#   ... offset=written-decoded=(-67, -64)  FAIL
+#   4 asset(s) with offset != (0, 0)                → exit 1
+```
+
+**判定式只有一条：**
+
+```
+偏移 = 写入热点 − 解码尖端，必须为 (0, 0)
+```
+
+- **写入热点**：`plnk\src\platform\cursor.rs` 的 `PEN_CURSOR_HOTSPOT`（脚本从源码 grep 它），也等于 `ico_to_cursor_bytes` 写进 `.cur` 头的两个 `u16`——`[10..12]` = x、`[12..14]` = y。这两处不一致同样是 bug：改代码，别改判据。
+- **解码尖端**：脚本的 `apex`，即最上面那行不透明像素的**中位** x（那一行是 4~5 像素宽的对称笔尖，取左边缘会偏 2 px）。`bbox` 顺带说明笔身只占画布的一个角，所以位图角点 (0,0) 必然落在透明区。
+- 偏移不为 `(0,0)` 时脚本 `exit 1`。四支笔色必须全部 `(0,0)`，且 apex 两两差 ≤2 px。偏移不对时先跑 `cargo test --manifest-path plnk/Cargo.toml --lib platform::cursor`，再决定改常量还是改资产。
+- `cursorsnap.ico` 是 8bpp 索引色，脚本只解 32bpp，会打印提示跳过——它不是笔形光标，别拿它当反例。
 
 ---
 

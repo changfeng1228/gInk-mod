@@ -1184,13 +1184,8 @@ impl InkSession {
     }
 
     fn client_position(&self, lparam: LPARAM) -> Option<PhysicalPointF> {
-        let x = i32::from((lparam.0 & 0xFFFF) as u16 as i16);
-        let y = i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16);
         let rect = self.surface.as_ref()?.window_rect().ok()?;
-        Some(PhysicalPointF::new(
-            (rect.left + x) as f32,
-            (rect.top + y) as f32,
-        ))
+        Some(client_screen_point(rect, client_offset(lparam)))
     }
 
     fn record_error(&mut self, error: GfxError) {
@@ -1198,6 +1193,35 @@ impl InkSession {
             self.last_error = Some(error.to_string());
         }
     }
+}
+
+/// Splits the client-area position carried by a mouse message (`lParam` of
+/// `WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_LBUTTONUP`) into signed pixel offsets.
+///
+/// Both halves are signed 16-bit values, not unsigned: with the mouse captured a
+/// drag leaves the window and the client coordinates go negative, which is
+/// exactly where an `as u16` without the sign extension would put the pen on the
+/// opposite side of the screen.
+pub fn client_offset(lparam: LPARAM) -> (i32, i32) {
+    let x = i32::from((lparam.0 & 0xFFFF) as u16 as i16);
+    let y = i32::from(((lparam.0 >> 16) & 0xFFFF) as u16 as i16);
+    (x, y)
+}
+
+/// Screen position (physical pixels) of a point in the overlay's client area.
+///
+/// The overlay is a frameless `WS_POPUP` window, so its window rect and its
+/// client area share one origin: `rect.left`/`rect.top` already are the screen
+/// position of client (0, 0), and the process is per-monitor DPI aware v2, so
+/// neither value is virtualized. No DPI scale may appear here — applying the
+/// scale twice (or dividing by it) is precisely the "pen does not follow the
+/// cursor" offset. The identity `screen = window origin + client offset` is
+/// covered at 96/120/144/192 DPI and negative monitor origins by
+/// `client_position_rebuilds_the_cursor_point_at_every_dpi_and_origin` and, with
+/// real routed input, by `lbutton_down_screen_point_equals_cursor_position`.
+pub fn client_screen_point(rect: PhysicalRect, client: (i32, i32)) -> PhysicalPointF {
+    let (x, y) = client;
+    PhysicalPointF::new((rect.left + x) as f32, (rect.top + y) as f32)
 }
 
 fn pointer_info(wparam: WPARAM) -> Option<(u32, POINTER_INFO)> {

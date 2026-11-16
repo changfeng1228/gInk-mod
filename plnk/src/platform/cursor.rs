@@ -167,18 +167,30 @@ impl Drop for CanvasCursors {
     }
 }
 
-/// Hot spot of the legacy pen cursors, in bitmap pixels.
+/// Hot spot of the legacy pen cursors, in bitmap pixels, visual top-down.
 ///
-/// The shipped 128x128 pen bitmaps are not full-canvas: the pen tip occupies
-/// the top-right quadrant, and the bottom-left quarter is fully transparent
-/// (measured on `cursorred.ico`: opaque pixels span x 64..=127, y 0..=63, and
-/// the tip apex is at x 109..=112 on row 0). The hot spot must therefore be the
-/// tip apex, not the bitmap origin.
+/// The shipped 128x128 pen bitmaps are not full-canvas: the pen occupies the
+/// bottom-right quadrant and everything above/left of it is transparent.
+/// Decoding `cursorred.ico` (32bpp `BITMAPINFOHEADER` with `biSize == 40`,
+/// `biHeight == 256` = 2 x 128, i.e. a 128-row XOR bitmap followed by a 1bpp
+/// AND mask) yields an opaque bounding box of x 64..=127, y 64..=127 and a tip
+/// apex at (67, 64) -- the median x of the pixels inked on the top-most inked
+/// row, which spans x 65..=69. `cursorgreen.ico`, `cursorblue.ico` and
+/// `cursoryellow.ico` decode to the same geometry pixel for pixel.
 ///
-/// Placing it at (0, 0) -- which is what an earlier revision did -- leaves the
-/// pointer's hotspot inside the transparent corner, so the visible pen is drawn
-/// 110 pixels to the right of where the user is drawing.
-const PEN_CURSOR_HOTSPOT: (u16, u16) = (110, 0);
+/// File row vs. visual row: a DIB stores its rows **bottom-up**, so file row 0
+/// is visual row 127. Read straight out of the file the pen therefore appears
+/// to sit in the top-right quadrant at y 0..=63, and the pixel at the start of
+/// the visible sweep lands at x 109..=112 on file row 0 -- that unflipped
+/// reading is what produced the earlier, wrong hot spot `(110, 0)`. The hot
+/// spot must be the apex of the **decoded** (row-flipped) bitmap: being an
+/// offset in the unflipped file grid or a field out of the ICO directory entry
+/// (`wPlanes`/`wBitCount` == `(1, 32)`) both put the pointer hotspot away from
+/// the drawn pen tip.
+///
+/// The `hotspot_tests` module decodes all four assets and asserts this constant
+/// equals the decoded apex, so the value cannot drift back to a file-row offset.
+const PEN_CURSOR_HOTSPOT: (u16, u16) = (67, 64);
 
 /// Loads a pen cursor from the shipped `.ico` with a corrected hot spot.
 ///
@@ -365,18 +377,233 @@ mod tests {
 /// The legacy application never hit this: it used
 /// `new System.Windows.Forms.Cursor(hicon)`, which builds a cursor from the
 /// merged bitmap and leaves the hotspot at the default (0, 0) — the top-left
-/// of the pen tip.
+/// corner of the 128x128 frame, inside the transparent quarter, i.e. the same
+/// class of bug in the opposite direction.
+///
+/// Everything here therefore works from **decoded pixels**, never from the ICO
+/// directory: the tests below decode the DIB, flip the bottom-up rows into
+/// visual order and take the pen tip (the apex of the opaque silhouette) as the
+/// only acceptable hot spot.
 #[cfg(test)]
 mod hotspot_tests {
     use super::*;
 
-    /// Reads `ICONDIR.idType` and the first entry's hotspot fields.
-    fn ico_header(bytes: &[u8]) -> (u16, u16, u16, u16) {
+    fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn i32_at(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// The four original pen-cursor assets, in [`PenCursorColor::ALL`] order.
+    const ASSET_NAMES: [&str; 4] = [
+        "cursorred.ico",
+        "cursorgreen.ico",
+        "cursorblue.ico",
+        "cursoryellow.ico",
+    ];
+
+    /// Alpha above which a pixel counts as inked by the pen.
+    ///
+    /// The shipped cursors antialias their silhouette: each variant carries 59
+    /// pixels at alpha 1..=20 which the AND mask still reports as opaque. That
+    /// fringe is real ink but far too faint to locate the nib, so the pen's
+    /// geometry is measured above this threshold.
+    const OPAQUE_ALPHA: u8 = 20;
+
+    /// A decoded single-image pen cursor, visual top-down.
+    ///
+    /// `row 0` is the row the user sees at the top of the bitmap, i.e. the ICO's
+    /// **last** stored row -- see [`decode_icon_pixels`].
+    struct DecodedIcon {
+        width: usize,
+        height: usize,
+        /// `opaque[y][x]`: alpha above [`OPAQUE_ALPHA`] **and** AND-mask bit
+        /// clear. This is the pen's silhouette.
+        opaque: Vec<Vec<bool>>,
+        /// `ink[y][x]`: any non-zero alpha at all, ignoring [`OPAQUE_ALPHA`].
+        ink: Vec<Vec<bool>>,
+        /// `mask_inked[y][x]`: what the AND mask alone says (bit 0 == inked).
+        mask_inked: Vec<Vec<bool>>,
+    }
+
+    impl DecodedIcon {
+        /// Pixels where the alpha channel and the AND mask disagree about
+        /// whether the pixel is inked at all.
+        fn mask_disagreements(&self) -> usize {
+            (0..self.height)
+                .flat_map(|y| (0..self.width).map(move |x| (y, x)))
+                .filter(|&(y, x)| self.ink[y][x] != self.opaque_or_mask(y, x))
+                .count()
+        }
+
+        /// True when the AND mask calls the pixel inked (bit 0 means inked).
+        fn opaque_or_mask(&self, y: usize, x: usize) -> bool {
+            self.mask_inked[y][x]
+        }
+
+        /// True when `(x, y)` is part of the pen's silhouette.
+        fn is_opaque(&self, x: u16, y: u16) -> bool {
+            let (x, y) = (usize::from(x), usize::from(y));
+            x < self.width && y < self.height && self.opaque[y][x]
+        }
+
+        /// Inclusive `(left, top, right, bottom)` of the opaque pixels.
+        fn opaque_bbox(&self) -> (usize, usize, usize, usize) {
+            let mut bbox: Option<(usize, usize, usize, usize)> = None;
+            for (y, row) in self.opaque.iter().enumerate() {
+                for (x, opaque) in row.iter().enumerate() {
+                    if !*opaque {
+                        continue;
+                    }
+                    bbox = Some(match bbox {
+                        None => (x, y, x, y),
+                        Some((left, top, right, bottom)) => {
+                            (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                        }
+                    });
+                }
+            }
+            bbox.expect("decoded icon has no opaque pixels")
+        }
+
+        /// The pen tip: the median x of the pixels inked on the top-most opaque
+        /// row. The median (not the left edge) is used because the row spans a
+        /// symmetric 5-pixel nib, so the left edge would bias the hot spot off
+        /// the pen's axis.
+        fn pen_apex(&self) -> (u16, u16) {
+            let (_, top, _, _) = self.opaque_bbox();
+            let mut inked: Vec<u16> = self.opaque[top]
+                .iter()
+                .enumerate()
+                .filter(|(_, opaque)| **opaque)
+                .map(|(x, _)| u16::try_from(x).expect("bitmap width fits u16"))
+                .collect();
+            assert!(
+                !inked.is_empty(),
+                "the top-most opaque row has no opaque pixel"
+            );
+            inked.sort_unstable();
+            (inked[inked.len() / 2], top as u16)
+        }
+    }
+
+    /// Decodes a single-image 32bpp ICO into top-down opacity bits.
+    ///
+    /// Mirrors what Windows does when it turns the file into a cursor image:
+    ///
+    /// 1. locate the DIB through `ICONDIRENTRY.dwImageOffset` (the entry's last
+    ///    dword) and read the `BITMAPINFOHEADER` fields `biWidth`, `biHeight`,
+    ///    `biBitCount` and `biSizeImage`;
+    /// 2. derive the pixel-array offset -- the ICO counterpart of a
+    ///    `BITMAPFILEHEADER.bfOffBits` -- as `dwImageOffset + biSize` (32bpp has
+    ///    no palette);
+    /// 3. stride each XOR row to a 4-byte boundary;
+    /// 4. reverse the row order, because `biHeight` counts the XOR rows **and**
+    ///    the trailing AND-mask rows and the XOR rows are stored **bottom-up**;
+    /// 5. treat a pixel as inked when its alpha is non-zero **and** its
+    ///    AND-mask bit is 0 (the mask is 1 where the pixel is transparent),
+    ///    and as part of the pen's silhouette only above [`OPAQUE_ALPHA`].
+    fn decode_icon_pixels(ico: &[u8]) -> DecodedIcon {
+        const ICONDIR: usize = 6;
+        const ICONDIRENTRY: usize = 16;
+        const BITMAPINFOHEADER: usize = 40;
+
+        assert!(ico.len() >= ICONDIR + ICONDIRENTRY, "truncated ICO directory");
+        assert_eq!(u16_at(ico, 2), 1, "not an ICO: ICONDIR.idType != 1");
+        assert_eq!(u16_at(ico, 4), 1, "expected a single-image icon");
+
+        let dib = u32_at(ico, ICONDIR + 12) as usize;
+        assert!(
+            ico.len() >= dib + BITMAPINFOHEADER,
+            "truncated DIB header at offset {dib}"
+        );
+        let bi_size = u32_at(ico, dib) as usize;
+        assert!(
+            bi_size >= BITMAPINFOHEADER,
+            "unexpected BITMAPINFOHEADER size {bi_size}"
+        );
+        let width = i32_at(ico, dib + 4);
+        let bi_height = i32_at(ico, dib + 8);
+        let bi_bit_count = u16_at(ico, dib + 14);
+        let bi_size_image = u32_at(ico, dib + 20) as usize;
+        assert_eq!(bi_bit_count, 32, "the shipped pen cursors are 32bpp");
+        assert!(
+            width > 0 && bi_height > 0,
+            "negative or zero DIB dimensions are not supported"
+        );
+
+        let width = width as usize;
+        let bi_height = bi_height as usize;
+        // `biHeight` spans the XOR bitmap and the trailing 1bpp AND mask; a
+        // 32bpp cursor image therefore always reports an even double height.
+        assert_eq!(bi_height % 2, 0, "32bpp icon DIBs carry an AND mask");
+        let height = bi_height / 2;
+        // DIB rows are padded to a 4-byte boundary.
+        let stride = (width * (usize::from(bi_bit_count) / 8) + 3) & !3;
+        let mask_stride = width.div_ceil(32) * 4;
+
+        let pixels = dib + bi_size;
+        // `biSizeImage` covers only the XOR bitmap and is commonly 0; fall back
+        // to the derived size so the mask offset stays correct either way.
+        let xor_size = if bi_size_image == 0 {
+            // Only the visual rows: the AND mask occupies the second half of
+            // `biHeight`.
+            stride * height
+        } else {
+            bi_size_image
+        };
+        let mask = pixels + xor_size;
+        assert!(
+            mask + mask_stride * height <= ico.len(),
+            "ICO image data is truncated: XOR bitmap ends at {}, AND mask needs {} bytes but the file ends at {}",
+            mask,
+            mask_stride * height,
+            ico.len()
+        );
+
+        let mut opaque = vec![vec![false; width]; height];
+        let mut ink = vec![vec![false; width]; height];
+        let mut mask_inked = vec![vec![false; width]; height];
+        for file_row in 0..height {
+            // Bottom-up DIB: file row 0 is the bottom visual row.
+            let visual_row = height - 1 - file_row;
+            let row_start = pixels + file_row * stride;
+            let mask_start = mask + file_row * mask_stride;
+            for column in 0..width {
+                let pixel = row_start + column * 4;
+                let alpha_byte = ico[pixel + 3];
+                let mask_bit = (ico[mask_start + column / 8] >> (7 - (column % 8))) & 1;
+                ink[visual_row][column] = alpha_byte != 0;
+                mask_inked[visual_row][column] = mask_bit == 0;
+                opaque[visual_row][column] = alpha_byte > OPAQUE_ALPHA && mask_bit == 0;
+            }
+        }
+        DecodedIcon {
+            width,
+            height,
+            opaque,
+            ink,
+            mask_inked,
+        }
+    }
+
+    fn decode_asset(name: &str) -> DecodedIcon {
+        decode_icon_pixels(&asset(name))
+    }
+
+    /// Reads `ICONDIR.idType` and the first entry's `wPlanes`/`wBitCount` pair.
+    fn ico_header(bytes: &[u8]) -> (u16, u16, u16) {
         assert!(bytes.len() >= 22, "truncated ICO header");
-        let id_type = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let planes = u16::from_le_bytes([bytes[10], bytes[11]]);
-        let bit_count = u16::from_le_bytes([bytes[12], bytes[13]]);
-        (id_type, planes, bit_count, 0)
+        let id_type = u16_at(bytes, 2);
+        let planes = u16_at(bytes, 10);
+        let bit_count = u16_at(bytes, 12);
+        (id_type, planes, bit_count)
     }
 
     fn asset(name: &str) -> Vec<u8> {
@@ -391,30 +618,96 @@ mod hotspot_tests {
     /// or avoid that misinterpretation.
     #[test]
     fn shipped_pen_cursor_assets_are_icons_with_a_bogus_cursor_hotspot() {
-        for name in [
-            "cursorred.ico",
-            "cursorgreen.ico",
-            "cursorblue.ico",
-            "cursoryellow.ico",
-        ] {
+        for name in ASSET_NAMES {
             let bytes = asset(name);
-            let (id_type, planes, bit_count, _) = ico_header(&bytes);
+            let (id_type, planes, bit_count) = ico_header(&bytes);
             assert_eq!(id_type, 1, "{name} must be an ICO (idType 1)");
-            assert!(
-                planes != 0 && bit_count != 0,
-                "{name} unexpectedly has a zero hotspot field"
+            // Read as a cursor, this pair becomes the hot spot: (1, 32) would
+            // put the pointer 32 rows above the visual pen tip.
+            assert_eq!(
+                (planes, bit_count),
+                (1, 32),
+                "{name}: the entry's wPlanes/wBitCount pair is what LoadImageW \
+                 would mistake for a cursor hot spot"
             );
-            // This is the defect: read as a cursor, these become the hotspot.
+        }
+    }
+
+    /// The hot spot must be the pen tip of the **decoded** bitmap, and the tip
+    /// must be an actually inked pixel.
+    ///
+    /// Decoding also pins the geometry the hot spot depends on: after the
+    /// bottom-up rows are flipped, the pen occupies the bottom-right quadrant
+    /// and its apex is the median x of the top-most opaque row.
+    #[test]
+    fn hotspot_is_the_decoded_pen_tip() {
+        for name in ASSET_NAMES {
+            let icon = decode_asset(name);
+            assert_eq!(
+                (icon.width, icon.height),
+                (128, 128),
+                "{name}: unexpected bitmap size"
+            );
+            assert_eq!(
+                icon.opaque_bbox(),
+                (64, 64, 127, 127),
+                "{name}: with the rows in visual order the pen occupies the \
+                 bottom-right quadrant"
+            );
+            let apex = icon.pen_apex();
             assert!(
-                (planes, bit_count) != (0, 0),
-                "{name}: if these were a real cursor hotspot the following \
-                 assertion would be meaningless"
+                icon.is_opaque(apex.0, apex.1),
+                "{name}: the measured apex {apex:?} is not an inked pixel"
+            );
+            assert_eq!(
+                apex, PEN_CURSOR_HOTSPOT,
+                "{name}: the hot spot must equal the decoded pen tip {apex:?}"
+            );
+        }
+    }
+
+    /// All four colour variants must agree on where the nib is: [`PEN_CURSOR_HOTSPOT`]
+    /// is a single shared constant, so it is only correct while they do. Fails
+    /// loudly with every measured value when they drift apart by more than 2 px.
+    #[test]
+    fn pen_apex_is_the_same_on_all_four_colour_variants() {
+        let apices: Vec<(&str, (u16, u16))> = ASSET_NAMES
+            .iter()
+            .map(|name| (*name, decode_asset(name).pen_apex()))
+            .collect();
+        let xs: Vec<u16> = apices.iter().map(|(_, (x, _))| *x).collect();
+        let ys: Vec<u16> = apices.iter().map(|(_, (_, y))| *y).collect();
+        let spread = |values: &[u16]| {
+            values.iter().copied().max().unwrap() - values.iter().copied().min().unwrap()
+        };
+        assert!(
+            spread(&xs) <= 2 && spread(&ys) <= 2,
+            "the four pen variants disagree on the nib by more than 2 px, so a single \
+             shared PEN_CURSOR_HOTSPOT cannot be right; measured apices: {apices:?}"
+        );
+    }
+
+    /// The AND mask is a second, independent statement about transparency, so
+    /// it has to agree with the alpha channel on every pixel -- otherwise
+    /// which pixels are "opaque" depends on which layer a loader consults.
+    #[test]
+    fn and_mask_agrees_with_the_alpha_channel() {
+        for name in ASSET_NAMES {
+            let bytes = asset(name);
+            let icon = decode_icon_pixels(&bytes);
+            assert_eq!(
+                icon.mask_disagreements(),
+                0,
+                "{name}: the AND mask contradicts the alpha channel"
             );
         }
     }
 
     /// Whatever loader the module uses, every pen cursor must report the pen
-    /// tip as its hotspot — never (wPlanes, wBitCount) of the ICO entry.
+    /// tip as its hot spot — never (wPlanes, wBitCount) of the ICO entry. The
+    /// expected value comes from the decoded pixels, not from the constant the
+    /// loader was built with; a hot spot that merely equals the constant would
+    /// prove nothing.
     #[test]
     fn pen_cursors_report_the_pen_tip_as_hotspot() {
         let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
@@ -425,20 +718,26 @@ mod hotspot_tests {
             "all four original pen cursors must load"
         );
         for color in PenCursorColor::ALL {
+            let name = color.filename();
+            let icon = decode_asset(name);
+            let apex = icon.pen_apex();
             let (x, y) = cursors
                 .hotspot_of(color)
-                .unwrap_or_else(|| panic!("{color:?} has no hotspot"));
+                .unwrap_or_else(|| panic!("{color:?} has no hot spot"));
             assert_eq!(
                 (x, y),
-                PEN_CURSOR_HOTSPOT,
-                "{color:?} hot spot must be {PEN_CURSOR_HOTSPOT:?}"
+                apex,
+                "{color:?} ({name}) hot spot must be the measured nib apex {apex:?}"
             );
-            // The bitmap's bottom-left quarter is transparent, so a hot spot in
-            // that corner would draw the visible pen far from the point the
-            // user is drawing on.
             assert!(
-                x > 0 || y > 0,
-                "{color:?} hot spot must not sit in the transparent corner"
+                icon.is_opaque(x, y),
+                "{color:?} ({name}) hot spot ({x}, {y}) is not an inked pixel"
+            );
+            let distance = x.abs_diff(apex.0).max(y.abs_diff(apex.1));
+            assert!(
+                distance <= 2,
+                "{color:?} ({name}) hot spot ({x}, {y}) is {distance} px from the \
+                 nib apex {apex:?}"
             );
         }
     }

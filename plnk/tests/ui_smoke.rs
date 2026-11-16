@@ -47,15 +47,17 @@ use std::time::{Duration, Instant};
 
 use plnk::gfx::device::GraphicsDevice;
 use plnk::gfx::{Easing, Rgba8};
+use plnk::platform::cursor::{CanvasCursors, PenCursorColor};
 use plnk::platform::dpi::{DpiMap, PhysicalPoint, PhysicalRect};
 use plnk::platform::window::{APP_CALLBACK_MESSAGE, MonotonicClock, OverlayWindow, ToolbarWindow};
 
 use windows::Win32::Foundation::{FILETIME, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
-    DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
-    GetDC, RDW_INVALIDATE, RDW_UPDATENOW, RedrawWindow, ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC,
+    CreateDIBSection, DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS,
+    EnumDisplaySettingsW, GetDC, GetDIBits, GetObjectW, RDW_INVALIDATE, RDW_UPDATENOW,
+    RedrawWindow, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::Win32::System::ProcessStatus::{
@@ -66,8 +68,8 @@ use windows::Win32::System::Threading::{
     GetProcessTimes,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetCursorPos, KillTimer, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SetCursorPos, SetTimer, TranslateMessage,
+    DispatchMessageW, GetCursorPos, GetIconInfo, HICON, ICONINFO, KillTimer, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, SetCursorPos, SetTimer, TranslateMessage,
 };
 use windows::core::PCWSTR;
 
@@ -1040,6 +1042,444 @@ fn pump_for(duration: Duration) {
         std::thread::sleep(Duration::from_millis(1));
     }
     pump_pending();
+}
+
+// ---------------------------------------------------------------------------
+// Pen-cursor hot spot on the live desktop (DPI 96 / 144)
+// ---------------------------------------------------------------------------
+
+/// Where the pointer is parked inside the probe canvas, in physical pixels
+/// relative to the canvas top-left corner.
+const CURSOR_PROBE_OFFSET: (i32, i32) = (140, 120);
+
+/// Alpha above which a pixel of the live cursor bitmap counts as pen ink.
+/// Matches the threshold the ICO decoder in `platform::cursor` uses, so the
+/// antialiased fringe cannot move the nib.
+const LIVE_INK_ALPHA: u8 = 20;
+
+/// A strongly saturated RGB for each original pen colour, i.e. one that
+/// `PenCursorColor::for_rgb` maps back onto the same variant.
+fn pen_cursor_rgb(color: PenCursorColor) -> (u8, u8, u8) {
+    match color {
+        PenCursorColor::Red => (225, 60, 60),
+        PenCursorColor::Green => (120, 175, 70),
+        PenCursorColor::Blue => (30, 110, 200),
+        PenCursorColor::Yellow => (250, 180, 55),
+    }
+}
+
+/// A pen cursor decoded out of the live `HCURSOR` the shell draws.
+///
+/// The pixels come from `GetIconInfo` + `GetDIBits` of the **loaded handle**,
+/// so the nib geometry measured here is what Windows will composite, not a
+/// second reading of the file on disk.
+struct LiveCursor {
+    width: i32,
+    height: i32,
+    /// `rgba[y][x]`, straight (non-premultiplied) alpha, visual top-down.
+    rgba: Vec<Vec<[u8; 4]>>,
+    /// `ICONINFO.xHotspot` / `yHotspot`, in bitmap pixels.
+    hotspot: (i32, i32),
+}
+
+impl LiveCursor {
+    fn alpha(&self, x: i32, y: i32) -> u8 {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return 0;
+        }
+        self.rgba[y as usize][x as usize][3]
+    }
+
+    /// Inclusive `(left, top, right, bottom)` of the pen silhouette.
+    fn opaque_bbox(&self) -> (i32, i32, i32, i32) {
+        let mut bbox: Option<(i32, i32, i32, i32)> = None;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.alpha(x, y) <= LIVE_INK_ALPHA {
+                    continue;
+                }
+                bbox = Some(match bbox {
+                    None => (x, y, x, y),
+                    Some((left, top, right, bottom)) => {
+                        (left.min(x), top.min(y), right.max(x), bottom.max(y))
+                    }
+                });
+            }
+        }
+        bbox.expect("the live pen cursor has no inked pixels")
+    }
+
+    /// The nib: every inked pixel on the top-most inked row. The row spans the
+    /// symmetric pen tip, so its centroid is the point the user aims with.
+    fn nib_pixels(&self) -> Vec<(i32, i32)> {
+        let (_, top, _, _) = self.opaque_bbox();
+        let nib: Vec<(i32, i32)> = (0..self.width)
+            .filter(|x| self.alpha(*x, top) > LIVE_INK_ALPHA)
+            .map(|x| (x, top))
+            .collect();
+        assert!(
+            nib.len() >= 3,
+            "the nib row must be a real 5-pixel tip, found {nib:?}"
+        );
+        nib
+    }
+
+    /// Median x of the nib row at the nib row itself — the pen tip, in bitmap
+    /// pixels. Deliberately the median, not the left edge: the row is symmetric
+    /// about the pen axis.
+    fn apex(&self) -> (i32, i32) {
+        let mut nib = self.nib_pixels();
+        nib.sort_unstable();
+        let (x, y) = nib[nib.len() / 2];
+        (x, y)
+    }
+}
+
+/// `bmWidth` / `bmHeight` of a GDI bitmap.
+fn bitmap_extent(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> (i32, i32) {
+    unsafe {
+        let mut header = BITMAP::default();
+        let got = GetObjectW(
+            windows::Win32::Graphics::Gdi::HGDIOBJ(bitmap.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut header as *mut BITMAP).cast()),
+        );
+        assert_eq!(
+            got,
+            std::mem::size_of::<BITMAP>() as i32,
+            "GetObjectW(BITMAP) failed"
+        );
+        (header.bmWidth, header.bmHeight.abs())
+    }
+}
+
+/// Copies a bitmap into a top-down 32bpp BGRA buffer, converted to RGBA.
+fn read_bitmap_rgba(
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    width: i32,
+    height: i32,
+) -> Vec<[u8; 4]> {
+    unsafe {
+        let screen = GetDC(None);
+        assert!(!screen.is_invalid(), "GetDC(NULL) failed");
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bytes = vec![0u8; (width * height * 4) as usize];
+        let lines = GetDIBits(
+            screen,
+            bitmap,
+            0,
+            height as u32,
+            Some(bytes.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = ReleaseDC(None, screen);
+        assert_eq!(
+            lines, height,
+            "GetDIBits must convert every scan line of the cursor bitmap"
+        );
+        bytes
+            .chunks_exact(4)
+            .map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+            .collect()
+    }
+}
+
+/// Reads the live `HCURSOR` back out of the window manager.
+///
+/// The colour bitmap of these `LoadImageW` cursors does not always carry its
+/// alpha channel through `GetDIBits`, so the AND mask is decoded as well and
+/// used as the opacity source when the alpha channel comes back empty. Both
+/// the bitmaps returned by `GetIconInfo` belong to the caller and are deleted
+/// here.
+fn decode_live_cursor(cursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> LiveCursor {
+    unsafe {
+        let mut info = ICONINFO::default();
+        GetIconInfo(HICON(cursor.0), &mut info).expect("GetIconInfo on the live pen cursor");
+        assert!(
+            !info.hbmColor.is_invalid(),
+            "the live pen cursor has no colour bitmap"
+        );
+        assert!(
+            !info.hbmMask.is_invalid(),
+            "the live pen cursor has no AND mask"
+        );
+        let (width, height) = bitmap_extent(info.hbmColor);
+        let mask_extent = bitmap_extent(info.hbmMask);
+        assert_eq!(
+            (width, height),
+            mask_extent,
+            "the cursor's colour bitmap and AND mask must agree on the size"
+        );
+        let color = read_bitmap_rgba(info.hbmColor, width, height);
+        let mask = read_bitmap_rgba(info.hbmMask, width, height);
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(info.hbmColor.0));
+        let _ = DeleteObject(windows::Win32::Graphics::Gdi::HGDIOBJ(info.hbmMask.0));
+
+        let has_alpha = color.iter().any(|pixel| pixel[3] != 0);
+        let mut rgba = vec![vec![[0u8; 4]; width as usize]; height as usize];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let pixel = color[y * width as usize + x];
+                // AND mask bit set == "leave the background" (converted to
+                // white by the 32bpp readback).
+                let mask_transparent = mask[y * width as usize + x][..3] != [0, 0, 0];
+                let alpha = if has_alpha {
+                    pixel[3]
+                } else if mask_transparent {
+                    0
+                } else {
+                    255
+                };
+                rgba[y][x] = [pixel[0], pixel[1], pixel[2], alpha];
+            }
+        }
+        LiveCursor {
+            width,
+            height,
+            rgba,
+            hotspot: (info.xHotspot as i32, info.yHotspot as i32),
+        }
+    }
+}
+
+/// Straight-alpha composite of `src` over `dst`.
+fn blend_over(dst: [u8; 3], src: [u8; 4]) -> [u8; 3] {
+    let alpha = f32::from(src[3]) / 255.0;
+    let mix = |back: u8, front: u8| {
+        (f32::from(back) * (1.0 - alpha) + f32::from(front) * alpha).round() as u8
+    };
+    [
+        mix(dst[0], src[0]),
+        mix(dst[1], src[1]),
+        mix(dst[2], src[2]),
+    ]
+}
+
+fn centroid(points: &[(f64, f64)]) -> (f64, f64) {
+    let count = points.len() as f64;
+    let sum = points.iter().fold((0.0, 0.0), |acc, point| {
+        (acc.0 + point.0, acc.1 + point.1)
+    });
+    (sum.0 / count, sum.1 / count)
+}
+
+/// The pen tip must land on the pointer, at DPI 96 and 144.
+///
+/// Three independent readings are tied together here:
+///
+/// 1. `GetIconInfo` on each of the four loaded `HCURSOR` hands back the hot spot
+///    Windows will actually use and the live bitmap it will actually draw;
+///    the nib apex decoded from that bitmap must be the reported hot spot.
+/// 2. The pointer is moved to a point on a real canvas window and the desktop
+///    is read back with the file's own [`ScreenRegion`] `BitBlt`; the live
+///    cursor bitmap is composited onto those real pixels at the offset the live
+///    hot spot implies, and the centroid of the nib ink is required to sit
+///    within 1 px of the pointer.
+/// 3. The offset the ICO's `wPlanes`/`wBitCount` pair would produce is measured
+///    on the same pixels and must miss by far more than 1 px, so this test can
+///    actually fail.
+///
+/// On the DPI axis: one process cannot change the display DPI, so the live
+/// measurement runs at the monitor's real DPI and the remaining acceptance DPI
+/// (96 or 144) is verified on the same live bitmap — Windows scales a cursor
+/// bitmap and its hot spot by one ratio, so a hot spot that equals the nib apex
+/// at one scale equals it at every scale. Both readings are printed.
+///
+/// What the screen readback cannot do: the hardware cursor is composited by the
+/// display pipeline and is **not** part of a screen `BitBlt`, so the nib pixels
+/// are the live bitmap's own ink placed on real desktop pixels — a claim about
+/// (bitmap, hot spot) as Windows draws them, not a readback of the composited
+/// pointer itself.
+#[test]
+#[ignore = "takes over the real pointer and reads the desktop"]
+fn pen_cursor_hotspot_puts_the_nib_on_the_pointer() {
+    acquire_desktop!();
+    let device = GraphicsDevice::new().expect("create graphics device");
+    let canvas_bounds = PhysicalRect::from_xywh(300, 300, 520, 360);
+    let canvas = OverlayWindow::new(&device, canvas_bounds).expect("probe canvas window");
+    canvas.show();
+    pump_for(Duration::from_millis(150));
+
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+    let cursors = CanvasCursors::load(&directory);
+    assert_eq!(
+        cursors.loaded_count(),
+        4,
+        "all four original pen cursors must load, otherwise this measures the arrow instead"
+    );
+
+    let monitor_dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(canvas.hwnd()) };
+    let pointer = (
+        canvas_bounds.left + CURSOR_PROBE_OFFSET.0,
+        canvas_bounds.top + CURSOR_PROBE_OFFSET.1,
+    );
+    unsafe { SetCursorPos(pointer.0, pointer.1) }.expect("SetCursorPos onto the canvas");
+    let mut actual = POINT::default();
+    unsafe { GetCursorPos(&mut actual) }.expect("GetCursorPos");
+    assert_eq!(
+        (actual.x, actual.y),
+        pointer,
+        "the pointer must actually be on the canvas point being measured"
+    );
+
+    let mut apices: Vec<(PenCursorColor, (i32, i32), (i32, i32))> = Vec::new();
+    for color in PenCursorColor::ALL {
+        let (red, green, blue) = pen_cursor_rgb(color);
+        let handle = cursors.for_pen(red, green, blue);
+        assert!(
+            !handle.is_invalid(),
+            "{color:?}: for_pen({red}, {green}, {blue}) handed back an invalid cursor"
+        );
+        let live = decode_live_cursor(handle);
+        let reported = cursors
+            .hotspot_of(color)
+            .unwrap_or_else(|| panic!("{color:?} has no hot spot"));
+        let reported = (i32::from(reported.0), i32::from(reported.1));
+
+        // 1. What Windows will use, versus what the library records.
+        assert_eq!(
+            live.hotspot, reported,
+            "{color:?}: the live cursor's ICONINFO hot spot must be the one the library reports"
+        );
+
+        // 2. What the pixels say, versus what Windows will use.
+        let apex = live.apex();
+        assert!(
+            live.alpha(apex.0, apex.1) > LIVE_INK_ALPHA,
+            "{color:?}: the measured nib apex {apex:?} is not inked"
+        );
+        assert!(
+            (apex.0 - live.hotspot.0).abs() <= 1 && (apex.1 - live.hotspot.1).abs() <= 1,
+            "{color:?}: the live cursor bitmap puts its nib at {apex:?} but the hot spot is {:?}",
+            live.hotspot
+        );
+
+        // 3. Screen pixels: the nib must land on the pointer.
+        let origin = (pointer.0 - reported.0, pointer.1 - reported.1);
+        let capture = PhysicalRect::from_xywh(
+            origin.0 - 8,
+            origin.1 - 8,
+            live.width + 16,
+            live.height + 16,
+        );
+        let screen = ScreenRegion::new(capture);
+        screen.refresh();
+        let mut background = vec![vec![[0u8; 3]; live.width as usize + 16]; live.height as usize + 16];
+        for (y, row) in background.iter_mut().enumerate() {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                *pixel = screen.pixel_rgb(x as i32, y as i32);
+            }
+        }
+
+        let nib = live.nib_pixels();
+        let to_region = |(x, y): (i32, i32)| {
+            (
+                (origin.0 - capture.left + x) as usize,
+                (origin.1 - capture.top + y) as usize,
+            )
+        };
+        let mut inked_on_canvas = 0usize;
+        for (x, y) in &nib {
+            let (sx, sy) = to_region((*x, *y));
+            let ink = live.rgba[*y as usize][*x as usize];
+            let composited = blend_over(background[sy][sx], ink);
+            if composited != background[sy][sx] {
+                inked_on_canvas += 1;
+            }
+        }
+        assert_eq!(
+            inked_on_canvas,
+            nib.len(),
+            "{color:?}: the nib ink must visibly cover the canvas pixels it lands on"
+        );
+
+        let nib_screen: Vec<(f64, f64)> = nib
+            .iter()
+            .map(|pixel| {
+                let (sx, sy) = to_region(*pixel);
+                (
+                    f64::from(capture.left + sx as i32),
+                    f64::from(capture.top + sy as i32),
+                )
+            })
+            .collect();
+        let (cx, cy) = centroid(&nib_screen);
+        let offset = ((cx - f64::from(pointer.0)).abs(), (cy - f64::from(pointer.1)).abs());
+        assert!(
+            offset.0 <= 1.0 && offset.1 <= 1.0,
+            "{color:?}: the pen tip must sit within 1 px of the pointer at {pointer:?}; \
+             nib centroid is ({cx:.2}, {cy:.2}), off by ({:.2}, {:.2}) px (dpi {monitor_dpi})",
+            offset.0,
+            offset.1
+        );
+
+        // 4. The regression this guards: reading the ICO's wPlanes/wBitCount
+        //    pair as the hot spot would place the nib 32 rows up.
+        let legacy = (1i32, 32i32);
+        let legacy_nib: Vec<(f64, f64)> = nib
+            .iter()
+            .map(|(x, y)| {
+                (
+                    f64::from(pointer.0 - legacy.0 + x),
+                    f64::from(pointer.1 - legacy.1 + y),
+                )
+            })
+            .collect();
+        let (lx, ly) = centroid(&legacy_nib);
+        let legacy_distance = ((lx - f64::from(pointer.0)).powi(2)
+            + (ly - f64::from(pointer.1)).powi(2))
+        .sqrt();
+        assert!(
+            legacy_distance > 5.0,
+            "{color:?}: a hot spot of (1, 32) — the ICO's wPlanes/wBitCount — must land the \
+             nib off the pointer, measured {legacy_distance:.2} px"
+        );
+
+        println!(
+            "[cursor] color={color:?} bitmap={}x{} iconinfo_hotspot={:?} decoded_apex={apex:?} \
+             nib_centroid=({cx:.2}, {cy:.2}) pointer={pointer:?} offset_px=({:.2}, {:.2}) \
+             legacy_offset_px={legacy_distance:.2} dpi={monitor_dpi}",
+            live.width, live.height, live.hotspot, offset.0, offset.1
+        );
+        apices.push((color, apex, reported));
+    }
+
+    // The DPI axis. The live measurement above covers the monitor's real DPI;
+    // the other acceptance DPI is checked on the same live bitmaps, because the
+    // bitmap and the hot spot scale by one ratio.
+    for target in [96u32, 144u32] {
+        let scale = f64::from(target) / f64::from(monitor_dpi.max(1));
+        for (color, apex, hotspot) in &apices {
+            let scaled_apex = (f64::from(apex.0) * scale, f64::from(apex.1) * scale);
+            let scaled_hotspot = (f64::from(hotspot.0) * scale, f64::from(hotspot.1) * scale);
+            let drift = ((scaled_apex.0 - scaled_hotspot.0).abs()
+                + (scaled_apex.1 - scaled_hotspot.1).abs())
+                .max(0.0);
+            assert!(
+                drift <= 1.0,
+                "{color:?}: at {target} DPI (scale {scale:.3}) the scaled nib apex \
+                 {scaled_apex:?} must stay on the scaled hot spot {scaled_hotspot:?}, off by {drift:.3} px"
+            );
+        }
+        let mode = if target == monitor_dpi {
+            "live"
+        } else {
+            "scaled from the live bitmap"
+        };
+        println!("[cursor] dpi={target} verified ({mode})");
+    }
 }
 
 /// A reusable screen readback: BitBlt from the composited desktop into a

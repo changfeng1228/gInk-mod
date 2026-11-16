@@ -8,6 +8,10 @@
 //! - `contact_cancel_does_not_commit_partial_history`: a cancelled contact
 //!   (pointer capture lost, window left, Esc) must drop the active stroke
 //!   without touching the document, its undo/redo history or the static layer.
+//! - `client_position_rebuilds_the_cursor_point_at_every_dpi_and_origin`: the
+//!   screen point rebuilt from `WM_LBUTTONDOWN`'s client position plus the
+//!   window origin must be the cursor's point at 96/120/144/192 DPI and for
+//!   negative monitor origins, with no DPI scale in the arithmetic.
 //!
 //! Desktop tests (`#[ignore]`, run with `--ignored --test-threads=1`):
 //! - `present_only_submits_dirty_region`: a real DirectComposition overlay
@@ -53,13 +57,13 @@ macro_rules! acquire_desktop {
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use plnk::app::InkSession;
+use plnk::app::{InkSession, client_offset, client_screen_point};
 use plnk::gfx::Rgba8;
 use plnk::gfx::device::GraphicsDevice;
 use plnk::gfx::ink_surface::InkSurface;
 use plnk::ink::{DirtyRect, DirtyRegion, InkController, PenPoint, PenStyle, PhysicalPointF};
 use plnk::input::{PointerKind, PointerNormalizer, PointerSample};
-use plnk::platform::dpi::{PhysicalPoint, PhysicalRect};
+use plnk::platform::dpi::{DipPoint, DpiMap, PhysicalPoint, PhysicalRect};
 use plnk::platform::window::{
     MonotonicClock, ToolbarWindow as BackdropWindow, current_monitor_rect,
 };
@@ -70,7 +74,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleDC, CreateDIBSection,
     DEVMODEW, DIB_RGB_COLORS, DeleteDC, DeleteObject, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
-    GetDC, ReleaseDC, SRCCOPY, SelectObject,
+    GetDC, ReleaseDC, SRCCOPY, ScreenToClient, SelectObject,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::ProcessStatus::{
@@ -220,6 +224,123 @@ fn contact_cancel_does_not_commit_partial_history() {
             .all(|point| point.position.x >= 200.0),
         "cancelled points must not leak into the next stroke"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cursor alignment: the pen must land under the pointer (headless, default run)
+// ---------------------------------------------------------------------------
+
+/// Packs a client-area position the way Windows fills a mouse message's
+/// `lParam`: low word x, high word y, both signed 16-bit.
+fn pack_client(x: i32, y: i32) -> LPARAM {
+    let low = u32::from(x as u16);
+    let high = u32::from(y as u16);
+    LPARAM((low | (high << 16)) as i32 as isize)
+}
+
+/// `WM_LBUTTONDOWN` carries a *client-area* position; the session turns it into
+/// the cursor's screen point as `window_rect.left/top + client offset`. That
+/// identity must hold for every DPI value Windows reports (96/120/144/192, i.e.
+/// 100/125/150/200 %) and for monitors left of or above the primary one, where
+/// both the window origin and the client offsets are signed.
+///
+/// One process cannot change its display's DPI, so the DPI grid is covered
+/// arithmetically here: each scale lays out the same DIP monitor in physical
+/// pixels and the reconstruction is checked against an oracle computed
+/// independently in `f64`. The live counterpart — real routed input compared
+/// against `GetCursorPos`/`ScreenToClient` at the DPI the monitor actually runs
+/// at — is `lbutton_down_screen_point_equals_cursor_position`.
+///
+/// REGRESSION GUARD: a conversion that applies the DPI scale to the client
+/// offset, applies it twice, or divides by it puts the pen away from the cursor
+/// (the reported drawing offset). No scale may appear in this arithmetic at all.
+#[test]
+fn client_position_rebuilds_the_cursor_point_at_every_dpi_and_origin() {
+    const DPIS: [u32; 4] = [96, 120, 144, 192];
+    // Monitor origins in DIPs: the primary at (0,0); a monitor to its left; the
+    // multi-monitor case where both axes are negative; and one to the right.
+    const ORIGINS: [(f64, f64); 4] = [
+        (0.0, 0.0),
+        (-1920.0, -180.0),
+        (-3840.0, -1080.0),
+        (2560.0, 240.0),
+    ];
+    // 1536x864 DIP is the physical 1920x1080 panel at 125 %.
+    const MONITOR_DIP: (f64, f64) = (1536.0, 864.0);
+
+    for dpi in DPIS {
+        let map = DpiMap::from_dpi(dpi);
+        let size = map.dip_to_physical(DipPoint::new(MONITOR_DIP.0 as f32, MONITOR_DIP.1 as f32));
+        let (width, height) = (size.x, size.y);
+        assert!(
+            width > 0 && height > 0,
+            "the DIP monitor must have a positive physical size at {dpi} DPI"
+        );
+
+        for (dip_x, dip_y) in ORIGINS {
+            let origin = map.dip_to_physical(DipPoint::new(dip_x as f32, dip_y as f32));
+            let rect = PhysicalRect::from_xywh(origin.x, origin.y, width, height);
+            // Client positions: the (0,0) corner Windows reports for a click on
+            // the very first pixel, the last pixel, an interior point, and three
+            // positions outside the client area — a drag with the mouse captured
+            // leaves the window and Windows then sends negative (and beyond the
+            // far edge) client coordinates.
+            let clients = [
+                (0, 0),
+                (width - 1, height - 1),
+                (width / 2, height / 3),
+                (-1, -1),
+                (-40, -25),
+                (width + 17, height + 9),
+            ];
+            for (x, y) in clients {
+                let lparam = pack_client(x, y);
+                // The packed halves must survive the sign extension: a plain
+                // `as u16` read turns -40 into 65496 and moves the pen to the
+                // opposite edge.
+                assert_eq!(
+                    client_offset(lparam),
+                    (x, y),
+                    "client offset ({x},{y}) must round-trip through lParam at {dpi} DPI (rect {rect:?})"
+                );
+
+                let screen = client_screen_point(rect, client_offset(lparam));
+                // Independent oracle: the DIP origin scaled in f64 (never through
+                // the physical-pixel path under test) plus the raw offset.
+                let expected_x = (dip_x * f64::from(dpi) / 96.0).round() as i32 + x;
+                let expected_y = (dip_y * f64::from(dpi) / 96.0).round() as i32 + y;
+                assert_eq!(
+                    (screen.x, screen.y),
+                    (expected_x as f32, expected_y as f32),
+                    "client ({x},{y}) at {dpi} DPI on the monitor at DIP ({dip_x},{dip_y}) must map to the cursor's screen point"
+                );
+
+                // The window origin is the client origin: client (0,0) is the
+                // window's top-left pixel, and the last client pixel is the last
+                // window pixel — never the exclusive right/bottom edge.
+                assert_eq!(
+                    (screen.x as i32 - rect.left, screen.y as i32 - rect.top),
+                    (x, y),
+                    "the screen point must differ from the window origin by exactly the client offset at {dpi} DPI"
+                );
+            }
+
+            // Corner check phrased against the window bounds: a conversion that
+            // is off by one pixel shows up at the far corner first.
+            let top_left = client_screen_point(rect, (0, 0));
+            assert_eq!(
+                (top_left.x as i32, top_left.y as i32),
+                (rect.left, rect.top),
+                "client (0,0) must be the window's top-left pixel at {dpi} DPI"
+            );
+            let last = client_screen_point(rect, (width - 1, height - 1));
+            assert_eq!(
+                (last.x as i32, last.y as i32),
+                (rect.right - 1, rect.bottom - 1),
+                "the last client pixel must be the window's bottom-right pixel, not the exclusive edge, at {dpi} DPI"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1396,117 @@ fn overlay_covers_true_physical_monitor_and_accepts_input_at_edges() {
         ink_pixels > 100,
         "ink must render at the physical right/bottom edge (non-white pixels: {ink_pixels})"
     );
+
+    session.surface_mut().expect("ink surface").hide();
+    drop(session);
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(80));
+}
+
+/// The live half of the cursor-alignment contract: with real routed input, the
+/// stroke must start exactly where `GetCursorPos` says the pointer is, and the
+/// session's `window_rect + client offset` reconstruction must equal that same
+/// screen point. `ScreenToClient` is the OS's own client-coordinate oracle, so
+/// the test compares the session's arithmetic against the message Windows
+/// actually produced.
+///
+/// The DPI value the monitor really runs at is reported, and the identity is
+/// asserted there; the 96/120/144/192 grid is covered arithmetically by
+/// `client_position_rebuilds_the_cursor_point_at_every_dpi_and_origin` because
+/// one process cannot change its display's DPI. Run this test with the cursor on
+/// a monitor left of the primary one to exercise a negative window origin.
+#[test]
+#[ignore = "creates a real overlay and drives the physical cursor"]
+fn lbutton_down_screen_point_equals_cursor_position() {
+    acquire_desktop!();
+    let device = GraphicsDevice::new().expect("create graphics device");
+    let bounds = current_monitor_rect().expect("physical monitor rect");
+    let mut session = InkSession::new(&device, bounds).expect("ink session");
+    session.surface_mut().expect("ink surface").show();
+    pump_for(Duration::from_millis(250));
+
+    let surface = session.surface().expect("ink surface");
+    let hwnd = surface.hwnd();
+    let rect = surface.window_rect().expect("overlay window rect");
+    assert_eq!(
+        rect, bounds,
+        "the overlay window must sit exactly on the monitor's physical rect"
+    );
+    // Which of the four grid DPIs this run actually exercised.
+    let dpi = DpiMap::from_window(hwnd).dpi();
+    println!("[ui-ink] live overlay dpi={dpi} window_rect={rect:?}");
+
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(10, 10, 10, 255), 12.0));
+    let original_cursor = cursor_position();
+    // The first client pixel, the middle, and a point near the bottom-right
+    // corner. On a monitor left of / above the primary one the window origin is
+    // negative, so the client-to-screen addition has to stay signed.
+    let probes = [
+        PhysicalPoint::new(rect.left + 20, rect.top + 20),
+        PhysicalPoint::new(rect.left + rect.width() / 2, rect.top + rect.height() / 2),
+        PhysicalPoint::new(rect.right - 80, rect.bottom - 80),
+    ];
+    for probe in probes {
+        move_cursor(probe);
+        pump_for(Duration::from_millis(60));
+        // The oracle: where Windows says the pointer is, and which client
+        // position it would put in the mouse message for that point.
+        let cursor = cursor_position();
+        let mut client = POINT {
+            x: cursor.x,
+            y: cursor.y,
+        };
+        unsafe { ScreenToClient(hwnd, &mut client) }.expect("ScreenToClient");
+        assert_eq!(
+            (rect.left + client.x, rect.top + client.y),
+            (cursor.x, cursor.y),
+            "the window origin plus the OS client position must be the cursor's screen point"
+        );
+        // The session's reconstruction of that same message must land on it.
+        let lparam = pack_client(client.x, client.y);
+        let derived = client_screen_point(rect, client_offset(lparam));
+        assert_eq!(
+            (derived.x as i32, derived.y as i32),
+            (cursor.x, cursor.y),
+            "WM_LBUTTONDOWN client ({},{}) must map back to the cursor at ({},{})",
+            client.x,
+            client.y,
+            cursor.x,
+            cursor.y
+        );
+
+        let strokes_before = session.controller().document().len();
+        mouse_button(true);
+        pump_for(Duration::from_millis(30));
+        // A short drag so the contact is a real stroke; its first point is the
+        // position of the button-down message.
+        move_cursor(PhysicalPoint::new(cursor.x + 12, cursor.y + 6));
+        pump_for(Duration::from_millis(16));
+        mouse_button(false);
+        pump_for(Duration::from_millis(150));
+
+        assert_eq!(
+            session.controller().document().len(),
+            strokes_before + 1,
+            "the routed drag must commit exactly one stroke"
+        );
+        let stroke = session
+            .controller()
+            .document()
+            .strokes()
+            .last()
+            .expect("the routed stroke");
+        let first = stroke.points().first().expect("stroke start");
+        assert!(
+            (first.position.x - cursor.x as f32).abs() <= 0.5
+                && (first.position.y - cursor.y as f32).abs() <= 0.5,
+            "the pen must start under the cursor: cursor ({},{}), stroke start ({},{})",
+            cursor.x,
+            cursor.y,
+            first.position.x,
+            first.position.y
+        );
+    }
 
     session.surface_mut().expect("ink surface").hide();
     drop(session);
