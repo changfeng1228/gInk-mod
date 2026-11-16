@@ -35,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MSG, RegisterClassExW,
     SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
     WM_CHAR, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WNDCLASSEXW, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD, ES_READONLY,
+    BS_AUTOCHECKBOX, ES_READONLY, WNDCLASSEXW, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR};
@@ -305,8 +305,9 @@ unsafe fn build_controls(hwnd: HWND) {
     }
 
     y += 10;
+    // A checkbox, not a push button: the row has to show the stored state.
     let check = unsafe {
-        create_control(
+        create_autostart_toggle(
             hwnd,
             ControlSpec {
                 class: "BUTTON",
@@ -708,4 +709,64 @@ unsafe fn apply_capture(edit: HWND, outcome: CaptureOutcome) {
     if !parent.is_invalid() {
         unsafe { refresh_status(parent) };
     }
+}
+
+/// Window style of the autostart control.
+///
+/// `BS_AUTOCHECKBOX` is the whole point: a push button answers `BM_SETCHECK` by
+/// ignoring it, so the old control looked identical whether the Startup shortcut
+/// existed or not -- the user could not tell whether autostart was on.
+/// `WS_BORDER` is deliberately absent: a checkbox paints its own box, and a
+/// client border around it makes it read as a button again.
+pub fn autostart_toggle_style() -> u32 {
+    (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32
+}
+
+/// Creates the autostart checkbox.
+///
+/// The control toggles itself on click (`BS_AUTOCHECKBOX`) and then reports
+/// `BN_CLICKED` through `WM_COMMAND`; the handler reads `BM_GETCHECK` to learn
+/// the new state, so the file system and the box can never disagree.
+unsafe fn create_autostart_toggle(parent: HWND, spec: ControlSpec<'_>, font: HFONT) -> HWND {
+    let ControlSpec {
+        text,
+        x,
+        y,
+        width,
+        height,
+        id,
+        ..
+    } = spec;
+    let class = HSTRING::from("BUTTON");
+    let text = HSTRING::from(text);
+    let toggle = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            &class,
+            &text,
+            WINDOW_STYLE(autostart_toggle_style()),
+            x,
+            y,
+            width,
+            height,
+            Some(parent),
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                id as isize as *mut core::ffi::c_void,
+            )),
+            None,
+            None,
+        )
+    }
+    .unwrap_or_default();
+    if !toggle.is_invalid() {
+        let _ = unsafe {
+            SendMessageW(
+                toggle,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            )
+        };
+    }
+    toggle
 }
