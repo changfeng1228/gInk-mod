@@ -56,11 +56,13 @@ use windows::Win32::System::ProcessStatus::{
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, mouse_event,
+    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, FindWindowW, GetCursorPos, MSG, PM_REMOVE, PeekMessageW, PostMessageW,
-    SetCursorPos, TranslateMessage, WM_CLOSE,
+    DispatchMessageW, FindWindowW, GetCursorPos, GetSystemMetrics, MSG, PM_REMOVE, PeekMessageW,
+    PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    TranslateMessage, WM_CLOSE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -529,7 +531,6 @@ fn mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits() {
     assert_eq!(session.controller().document().len(), 0);
     drop(toolbar);
     drop(session);
-    drop(backdrop);
     move_cursor(original_cursor);
     pump_for(Duration::from_millis(80));
 }
@@ -616,7 +617,6 @@ fn mvp_real_app_launch_draws_and_exits_cleanly() {
         );
     }
 
-    drop(backdrop);
     move_cursor(original_cursor);
     pump_for(Duration::from_millis(80));
 }
@@ -863,7 +863,6 @@ fn overlay_covers_true_physical_monitor_and_accepts_input_at_edges() {
 
     session.surface_mut().expect("ink surface").hide();
     drop(session);
-    drop(backdrop);
     move_cursor(original_cursor);
     pump_for(Duration::from_millis(80));
 }
@@ -1112,7 +1111,29 @@ fn cursor_position() -> PhysicalPoint {
 }
 
 fn move_cursor(point: PhysicalPoint) {
-    unsafe { SetCursorPos(point.x, point.y) }.expect("SetCursorPos");
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as i64;
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as i64;
+    let width = (unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) } as i64).max(1);
+    let height = (unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) } as i64).max(1);
+    let normalize = |value: i64, origin: i64, extent: i64| {
+        let last = (extent - 1).max(1);
+        (((value - origin) * 65_535 + last / 2) / last).clamp(0, 65_535) as i32
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalize(point.x as i64, left, width),
+                dy: normalize(point.y as i64, top, height),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    assert_eq!(sent, 1, "SendInput must inject the absolute mouse move");
 }
 
 fn mouse_button(down: bool) {
@@ -1121,7 +1142,21 @@ fn mouse_button(down: bool) {
     } else {
         MOUSEEVENTF_LEFTUP
     };
-    unsafe { mouse_event(flag, 0, 0, 0, 0) };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flag,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) };
+    assert_eq!(sent, 1, "SendInput must inject the mouse button event");
 }
 
 fn click_button(toolbar: &mut ToolbarWindow, button: ButtonId) {
@@ -1346,6 +1381,37 @@ impl ScreenRegion {
             }
         });
         count
+    }
+
+    /// Writes the captured pixels as a top-down 32-bit BMP for the side-by-side
+    /// user-acceptance artifact (converted to PNG by the SDD script).
+    fn save_bmp(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let image_size = (self.bounds.width() as u32)
+            .checked_mul(self.bounds.height() as u32)
+            .and_then(|value| value.checked_mul(4))
+            .expect("screen region size overflow");
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        file.write_all(b"BM")?;
+        file.write_all(&(14u32 + 40 + image_size).to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        file.write_all(&(14u32 + 40).to_le_bytes())?;
+        file.write_all(&40u32.to_le_bytes())?;
+        file.write_all(&self.bounds.width().to_le_bytes())?;
+        file.write_all(&(-self.bounds.height()).to_le_bytes())?;
+        file.write_all(&1u16.to_le_bytes())?;
+        file.write_all(&32u16.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&image_size.to_le_bytes())?;
+        file.write_all(&2835i32.to_le_bytes())?;
+        file.write_all(&2835i32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        file.write_all(&0u32.to_le_bytes())?;
+        let pixels =
+            unsafe { std::slice::from_raw_parts(self.pixels as *const u8, image_size as usize) };
+        file.write_all(pixels)?;
+        file.flush()
     }
 }
 
@@ -1684,4 +1750,319 @@ fn send_escape() {
             0,
         );
     }
+}
+
+/// Opt-in artifact generator, not an acceptance assertion. Run in a fresh
+/// process with PLNK_CAPTURE_LEGACY=1 while the legacy gInk instance is running.
+#[test]
+#[ignore = "opt-in: drives the running legacy gInk and the real plnk app"]
+fn capture_fixed_strokes_side_by_side() {
+    if std::env::var("PLNK_CAPTURE_LEGACY").ok().as_deref() != Some("1") {
+        println!("capture skipped; set PLNK_CAPTURE_LEGACY=1 to drive both apps");
+        return;
+    }
+    let legacy_running = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "if (Get-Process -Name gInk -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }",
+        ])
+        .status()
+        .expect("check legacy process")
+        .success();
+    assert!(
+        legacy_running,
+        "start the legacy gInk instance before capture"
+    );
+    let output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.superpowers/sdd/2026-11-15-plnk-rust-rewrite/side-by-side");
+    std::fs::create_dir_all(&output).expect("create capture directory");
+
+    let region = PhysicalRect::from_xywh(200, 150, 1400, 800);
+    let original_cursor = cursor_position();
+
+    // A single global-hotkey press guarantees an annotation toolbar; clicking
+    // Pen 1 then guarantees Drawing regardless of the previous Tray/Drawing/
+    // Pointer state. This avoids Esc and Pointer-mode ambiguity entirely.
+    send_legacy_global_hotkey();
+    pump_for(Duration::from_millis(600));
+    click_point(legacy_toolbar_button_center(ButtonId::Pen(1)));
+    let probe_region = PhysicalRect::from_xywh(20, 20, 160, 90);
+    let probe_screen = ScreenRegion::new(probe_region);
+    probe_screen.refresh();
+    let baseline_red = red_ink_pixels(&probe_screen, probe_region);
+    draw_polyline(&[(60, 60), (140, 60)], Duration::from_millis(10));
+    pump_for(Duration::from_millis(250));
+    probe_screen.refresh();
+    send_key(b'1');
+    draw_polyline(&[(60, 60), (140, 60)], Duration::from_millis(10));
+    pump_for(Duration::from_millis(250));
+    probe_screen.refresh();
+    if red_ink_pixels(&probe_screen, probe_region) <= baseline_red + 10 {
+        send_legacy_global_hotkey();
+        pump_for(Duration::from_millis(400));
+        send_key(b'1');
+        draw_polyline(&[(60, 60), (140, 60)], Duration::from_millis(10));
+        pump_for(Duration::from_millis(250));
+        probe_screen.refresh();
+    }
+    let observed_red = red_ink_pixels(&probe_screen, probe_region);
+    if observed_red <= baseline_red + 10 {
+        let failure_screen = ScreenRegion::new(PhysicalRect::from_xywh(0, 0, 2560, 1600));
+        failure_screen.refresh();
+        failure_screen
+            .save_bmp(&output.join("legacy-probe-failure.bmp"))
+            .expect("save legacy probe failure screenshot");
+        println!(
+            "[capture] legacy red baseline={baseline_red} observed={observed_red}; failure screenshot saved"
+        );
+    }
+    assert!(
+        observed_red > baseline_red + 10,
+        "legacy must produce real red ink in Drawing mode"
+    );
+    send_key(b'1');
+    draw_fixed_set(None);
+    pump_for(Duration::from_millis(800));
+    let screen = ScreenRegion::new(region);
+    screen.refresh();
+    let legacy_ink = red_ink_pixels(&screen, region);
+    assert!(
+        legacy_ink > 500,
+        "legacy capture must contain the fixed strokes"
+    );
+    screen
+        .save_bmp(&output.join("legacy-fixed-strokes.bmp"))
+        .expect("save legacy capture");
+    click_point(legacy_toolbar_button_center(ButtonId::Exit));
+    pump_for(Duration::from_millis(400));
+
+    let exe = env!("CARGO_BIN_EXE_plnk");
+    let log_path = app_log_path(exe);
+    let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+    let mut child = Command::new(exe)
+        .args(["--no-hotkeys", "--draw", "--exit-after-ms", "60000"])
+        .spawn()
+        .expect("spawn plnk.exe");
+    wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk overlay"),
+        Duration::from_secs(10),
+    )
+    .expect("plnk overlay");
+    let toolbar = wait_for_window(
+        w!("plnk_gate_window"),
+        w!("plnk toolbar"),
+        Duration::from_secs(10),
+    )
+    .expect("plnk toolbar");
+    pump_for(Duration::from_millis(600));
+    click_point(real_toolbar_button_center(toolbar, ButtonId::Pen(1)));
+    draw_fixed_set(Some(toolbar));
+    pump_for(Duration::from_millis(800));
+    screen.refresh();
+    let plnk_ink = red_ink_pixels(&screen, region);
+    assert!(
+        plnk_ink > 500,
+        "plnk capture must contain the fixed strokes"
+    );
+    screen
+        .save_bmp(&output.join("plnk-fixed-strokes.bmp"))
+        .expect("save plnk capture");
+
+    std::fs::write(
+        output.join("plnk-capture.log"),
+        app_log_since(&log_path, log_start),
+    )
+    .expect("save plnk log");
+    std::fs::write(
+        output.join("capture-notes.txt"),
+        format!(
+            "Fixed set: slow line, fast curve, zigzag, circle, short dots, highlighter overlap.\n\
+             Legacy input: Ctrl+Alt+Z to show annotation, computed Pen 1/Pen 5/Exit toolbar clicks, absolute SendInput paths.\n\
+             plnk input: {exe} --no-hotkeys --draw, real toolbar clicks and the same absolute SendInput paths.\n\
+             Red/orange ink pixel samples: legacy={legacy_ink}, plnk={plnk_ink}.\n\
+             This is an artifact for user comparison, not a claim of user approval.\n"
+        ),
+    )
+    .expect("save capture notes");
+
+    send_escape();
+    let shell = wait_for_window(
+        w!("plnk_app_shell_window"),
+        w!("plnk"),
+        Duration::from_secs(5),
+    )
+    .expect("plnk shell");
+    unsafe { PostMessageW(Some(shell), WM_CLOSE, WPARAM(0), LPARAM(0)) }.expect("close plnk");
+    assert!(wait_for_exit(&mut child, Duration::from_secs(10)).success());
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(100));
+    println!("captures written to {}", output.display());
+}
+
+fn send_key(key: u8) {
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            key,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            0,
+        );
+    }
+    pump_for(Duration::from_millis(25));
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            key,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
+            0,
+        );
+    }
+    pump_for(Duration::from_millis(40));
+}
+
+fn send_legacy_global_hotkey() {
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            0,
+        );
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            0,
+        );
+    }
+    send_key(b'Z');
+    unsafe {
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_MENU.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
+            0,
+        );
+        windows::Win32::UI::Input::KeyboardAndMouse::keybd_event(
+            windows::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL.0 as u8,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
+            0,
+        );
+    }
+    pump_for(Duration::from_millis(60));
+}
+
+fn click_point(point: POINT) {
+    move_cursor(PhysicalPoint::new(point.x, point.y));
+    pump_for(Duration::from_millis(45));
+    mouse_button(true);
+    pump_for(Duration::from_millis(25));
+    mouse_button(false);
+    pump_for(Duration::from_millis(80));
+}
+
+fn draw_polyline(points: &[(i32, i32)], delay: Duration) {
+    let Some(first) = points.first() else {
+        return;
+    };
+    move_cursor(PhysicalPoint::new(first.0, first.1));
+    pump_for(Duration::from_millis(30));
+    mouse_button(true);
+    for point in &points[1..] {
+        move_cursor(PhysicalPoint::new(point.0, point.1));
+        pump_for(delay);
+    }
+    mouse_button(false);
+    pump_for(Duration::from_millis(80));
+}
+
+fn draw_fixed_set(toolbar: Option<HWND>) {
+    let line: Vec<(i32, i32)> = (0..=36).map(|i| (300 + i * 15, 230)).collect();
+    draw_polyline(&line, Duration::from_millis(14));
+    let curve: Vec<(i32, i32)> = (0..=18)
+        .map(|i| (300 + i * 32, 360 + ((i as f32 * 0.55).sin() * 80.0) as i32))
+        .collect();
+    draw_polyline(&curve, Duration::from_millis(3));
+    let zigzag: Vec<(i32, i32)> = (0..=14)
+        .map(|i| (300 + i * 42, 550 + if i % 2 == 0 { -55 } else { 55 }))
+        .collect();
+    draw_polyline(&zigzag, Duration::from_millis(4));
+    let circle: Vec<(i32, i32)> = (0..=36)
+        .map(|i| {
+            let angle = i as f32 * std::f32::consts::TAU / 36.0;
+            (
+                1250 + (140.0 * angle.cos()) as i32,
+                400 + (140.0 * angle.sin()) as i32,
+            )
+        })
+        .collect();
+    draw_polyline(&circle, Duration::from_millis(6));
+    for i in 0..6 {
+        click_point(POINT {
+            x: 300 + i * 70,
+            y: 700,
+        });
+    }
+    if let Some(toolbar) = toolbar {
+        click_point(real_toolbar_button_center(toolbar, ButtonId::Pen(5)));
+    } else {
+        click_point(legacy_toolbar_button_center(ButtonId::Pen(5)));
+    }
+    let horizontal: Vec<(i32, i32)> = (0..=18).map(|i| (760 + i * 29, 820)).collect();
+    draw_polyline(&horizontal, Duration::from_millis(5));
+    let vertical: Vec<(i32, i32)> = (0..=14).map(|i| (1020, 660 + i * 17)).collect();
+    draw_polyline(&vertical, Duration::from_millis(5));
+}
+
+fn red_ink_pixels(screen: &ScreenRegion, region: PhysicalRect) -> usize {
+    screen.count_matching(region, |[r, g, b]| {
+        r > 150 && r > g.saturating_add(35) && r > b.saturating_add(35)
+    })
+}
+
+fn legacy_toolbar_button_center(button: ButtonId) -> POINT {
+    // Current acceptance instance: 150% DPI, Toolbar_Height=0.05, pen-width
+    // button hidden, default bottom-right placement. These are read-only
+    // calculations of the legacy FormCollection layout.
+    let monitor = current_monitor_rect().expect("legacy monitor rect");
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() };
+    let scale = dpi as f32 / 96.0;
+    let mut settings = Settings::defaults();
+    settings.toolbar_height = 0.05;
+    settings.pen_width_icon = false;
+    let model = ToolbarModel::from_settings(&settings);
+    let height_dip = monitor.height() as f32 / scale * settings.toolbar_height;
+    let layout = plnk::ui::toolbar::ToolbarLayout::new(&model, height_dip, false);
+    let panel_width = (layout.panel_width() * scale).round() as i32;
+    let panel_height = (layout.height() * scale).round() as i32;
+    let mut info = windows::Win32::Graphics::Gdi::MONITORINFO {
+        cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let handle = unsafe {
+        windows::Win32::Graphics::Gdi::MonitorFromPoint(
+            POINT::default(),
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTOPRIMARY,
+        )
+    };
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(handle, &mut info);
+    }
+    let origin = PhysicalPoint::new(
+        info.rcWork.right - panel_width,
+        info.rcWork.bottom - panel_height - (15.0 * scale).round() as i32,
+    );
+    let rect = layout.button_rect(button).expect("legacy button rect");
+    let point = POINT {
+        x: origin.x + ((rect.left + rect.right) * 0.5 * scale).round() as i32,
+        y: origin.y + ((rect.top + rect.bottom) * 0.5 * scale).round() as i32,
+    };
+    println!(
+        "[capture] legacy {button:?} click at ({}, {})",
+        point.x, point.y
+    );
+    point
 }

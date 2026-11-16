@@ -638,6 +638,7 @@ pub struct InkSession {
     mouse: MouseNormalizer,
     active_pointer: Option<u32>,
     mouse_down: bool,
+    committed: Option<usize>,
     last_error: Option<String>,
 }
 
@@ -652,6 +653,7 @@ impl InkSession {
             mouse: MouseNormalizer::new(),
             active_pointer: None,
             mouse_down: false,
+            committed: None,
             last_error: None,
         });
         let data = &mut *session as *mut Self as *mut core::ffi::c_void;
@@ -676,6 +678,12 @@ impl InkSession {
     /// pressure channel is enabled per contact from the pointer capability.
     pub fn set_pen_style(&mut self, style: PenStyle) {
         self.pen_style = PenStyle::new(style.color, style.width, style.pressure_enabled);
+    }
+
+    /// Number of document strokes after the latest commit, drained by the
+    /// shell for bounded acceptance diagnostics.
+    pub fn take_committed(&mut self) -> Option<usize> {
+        self.committed.take()
     }
 
     /// First error since the last call; the shell logs it on its next command
@@ -940,7 +948,9 @@ impl InkSession {
         };
         surface.draw_committed(stroke, &region)?;
         surface.clear_active(&region)?;
-        surface.present(region).map(|_| ())
+        surface.present(region)?;
+        self.committed = Some(controller.document().len());
+        Ok(())
     }
 
     fn redraw_and_present(&mut self, region: &DirtyRegion) -> Result<(), GfxError> {
@@ -1691,6 +1701,14 @@ impl Shell {
     /// Surfaces deferred drawing errors (the input hook cannot log directly
     /// because it runs while the shell is not borrowed).
     fn log_ink_error(&mut self) {
+        if let Some(count) = self
+            .ink
+            .as_mut()
+            .and_then(|session| session.take_committed())
+        {
+            self.log
+                .info(&format!("ink committed: {count} document strokes"));
+        }
         if let Some(message) = self.ink.as_mut().and_then(|session| session.take_error()) {
             self.log.warn(&format!("drawing session: {message}"));
         }
