@@ -29,8 +29,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetDlgItem, GetMessageW, GetWindowTextW, IsDialogMessageW, IsWindow, MSG, RegisterClassExW,
     SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
-    WM_COMMAND, WM_DESTROY, WM_INITDIALOG, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -45,6 +45,15 @@ const ID_AUTOSTART: i32 = 3;
 const ID_STATUS: i32 = 4;
 const ROW_BASE: i32 = 100;
 const ROWS_PER_ENTRY: i32 = 2;
+
+/// The message the window procedure builds its children on.
+///
+/// Exposed so a regression test can assert it is `WM_CREATE`: using
+/// `WM_INITDIALOG` here silently produces an empty window, because
+/// `CreateWindowExW` does not send it.
+pub fn control_message_for_creation() -> u32 {
+    WM_CREATE
+}
 
 const WINDOW_CLASS: &str = "plnk_options_window";
 const WINDOW_TITLE: &str = "plnk 设置";
@@ -206,7 +215,11 @@ extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
-        WM_INITDIALOG => {
+        // A plain `CreateWindowExW` window never receives `WM_INITDIALOG` (that
+        // message belongs to the `DialogBox*` family), so building the children
+        // there left the frame empty. `WM_CREATE` is the creation message every
+        // window gets, right before it is first shown.
+        WM_CREATE => {
             unsafe { build_controls(hwnd) };
             LRESULT(0)
         }

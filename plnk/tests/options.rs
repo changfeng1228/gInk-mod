@@ -153,3 +153,21 @@ fn rebind_is_visible_in_the_registration_map() {
     };
     assert_eq!(map.matches(event), Some(Command::ToggleInk));
 }
+
+/// The settings window must create its controls when the window is created.
+///
+/// Regression: the window procedure built its children on `WM_INITDIALOG`, but
+/// the window is created with `CreateWindowExW` (a plain window), not with a
+/// `DialogBox*` call. A plain window never receives `WM_INITDIALOG`, so
+/// `build_controls` never ran and the user saw an empty white frame.
+#[test]
+fn settings_window_builds_controls_from_a_plain_window_message() {
+    use plnk::ui::options_window::control_message_for_creation;
+    // The message the window procedure must treat as "build the children".
+    assert_eq!(
+        control_message_for_creation(),
+        windows::Win32::UI::WindowsAndMessaging::WM_CREATE,
+        "children must be built on WM_CREATE; WM_INITDIALOG never arrives for \
+         a CreateWindowExW window"
+    );
+}
