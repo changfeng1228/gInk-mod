@@ -60,9 +60,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, FindWindowW, GetCursorPos, GetSystemMetrics, MSG, PM_REMOVE, PeekMessageW,
-    PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
-    TranslateMessage, WM_CLOSE,
+    CURSOR_SHOWING, CURSORINFO, DispatchMessageW, FindWindowW, GetCursorInfo, GetCursorPos,
+    GetSystemMetrics, HCURSOR, IDC_APPSTARTING, IDC_ARROW, IDC_WAIT, LoadCursorW, MSG, PM_REMOVE,
+    PeekMessageW, PostMessageW, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, TranslateMessage, WM_CLOSE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -533,6 +534,162 @@ fn mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits() {
     drop(session);
     move_cursor(original_cursor);
     pump_for(Duration::from_millis(80));
+}
+
+/// Regression for the reported "ink only appears after mouse release" bug.
+///
+/// The active layer is cleared inside each new point's dirty rect and then
+/// repainted incrementally. The dirty rect spans the previous quadratic, so a
+/// repaint that starts only at the newest midpoint erases a piece of the
+/// already drawn line and never restores it: while the button is held the
+/// stroke shows up as dashes, and only the release path (which redraws the
+/// whole stroke into the static cache) makes it continuous. This test reads
+/// the screen with the button still held and requires an unbroken line.
+#[test]
+#[ignore = "creates a real DirectComposition overlay and injects real mouse input"]
+fn live_stroke_is_continuous_mid_drag_and_commits_on_release() {
+    let device = GraphicsDevice::new().expect("create graphics device");
+    let bounds = PhysicalRect::from_xywh(300, 300, 900, 420);
+    let original_cursor = cursor_position();
+
+    let mut backdrop = BackdropWindow::new(&device, bounds).expect("backdrop window");
+    backdrop
+        .fill(Rgba8::new(255, 255, 255, 255))
+        .expect("backdrop fill");
+    backdrop.show();
+    pump_for(Duration::from_millis(150));
+
+    let mut session = InkSession::new(&device, bounds).expect("ink session");
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(225, 60, 60, 255), 16.0));
+    session.surface_mut().expect("ink surface").show();
+    pump_for(Duration::from_millis(250));
+    assert_eq!(
+        session.pen_cursor_count(),
+        4,
+        "all four original pen cursors must load from assets/icons"
+    );
+    assert!(
+        session.take_cursor_warnings().is_empty(),
+        "loading the original pen cursors must not warn"
+    );
+
+    // A horizontal line, one injected absolute move per sample.
+    move_cursor(PhysicalPoint::new(380, 480));
+    pump_for(Duration::from_millis(40));
+    mouse_button(true);
+    pump_for(Duration::from_millis(30));
+    for step in 1..=14 {
+        move_cursor(PhysicalPoint::new(380 + step * 30, 480));
+        pump_for(Duration::from_millis(10));
+    }
+
+    // The button is still held: no release path has run yet.
+    pump_for(Duration::from_millis(220));
+    let check_area = PhysicalRect::new(420, 440, 800, 520);
+    let screen = ScreenRegion::new(check_area);
+    screen.refresh();
+    let mid_drag_coverage = screen.column_coverage(check_area);
+    let mid_drag_ink = screen.count_matching(check_area, |[r, g, b]| {
+        r > 150 && r > g.saturating_add(35) && r > b.saturating_add(35)
+    });
+    assert!(
+        mid_drag_coverage > 0.95,
+        "while the button is held the line must be continuous, not dashed \
+         (column coverage {mid_drag_coverage:.3}, ink pixels {mid_drag_ink})"
+    );
+    assert!(
+        mid_drag_ink > 100,
+        "the live stroke must be visible before mouse-up (red pixels: {mid_drag_ink})"
+    );
+    assert_eq!(
+        session.take_error(),
+        None,
+        "the live drawing path must not swallow a rendering error"
+    );
+    assert_eq!(
+        session.controller().document().len(),
+        0,
+        "nothing is committed while the button is held"
+    );
+
+    mouse_button(false);
+    pump_for(Duration::from_millis(250));
+    assert_eq!(
+        session.take_committed(),
+        Some(1),
+        "releasing must commit the live stroke exactly once"
+    );
+    assert_eq!(session.controller().document().len(), 1);
+    assert_eq!(
+        session.take_error(),
+        None,
+        "the commit path must not report a rendering error"
+    );
+    screen.refresh();
+    assert!(
+        screen.column_coverage(check_area) > 0.95,
+        "the committed stroke must stay continuous on screen"
+    );
+
+    session.close_annotation().expect("clear the annotation");
+    session.surface_mut().expect("ink surface").hide();
+    drop(session);
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(100));
+}
+
+/// Regression for the reported spinning-circle cursor: with a NULL class
+/// cursor Windows leaves the system wait/app-starting cursor over the overlay.
+#[test]
+#[ignore = "creates a real topmost overlay and inspects the OS cursor"]
+fn drawing_overlay_cursor_is_pen_cursor_never_wait_cursor() {
+    let device = GraphicsDevice::new().expect("create graphics device");
+    let bounds = PhysicalRect::from_xywh(500, 500, 520, 320);
+    let original_cursor = cursor_position();
+
+    let mut session = InkSession::new(&device, bounds).expect("ink session");
+    // The default pen is one of the original four colours (legacy pen 1).
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(225, 60, 60, 255), 8.0));
+    session.surface_mut().expect("ink surface").show();
+    pump_for(Duration::from_millis(250));
+
+    move_cursor(PhysicalPoint::new(760, 660));
+    pump_for(Duration::from_millis(150));
+    let pen = current_cursor();
+    let arrow = stock_cursor(IDC_ARROW);
+    let wait = stock_cursor(IDC_WAIT);
+    let appstarting = stock_cursor(IDC_APPSTARTING);
+    assert!(pen.shown, "the cursor must be visible over the overlay");
+    assert_ne!(
+        pen.handle, wait,
+        "drawing must not show the system wait (spinning circle) cursor"
+    );
+    assert_ne!(
+        pen.handle, appstarting,
+        "drawing must not show the system app-starting cursor"
+    );
+    assert_ne!(
+        pen.handle, arrow,
+        "a red pen must use the original pen cursor, not the plain arrow"
+    );
+
+    // A pen colour with no matching original cursor falls back to the arrow;
+    // it must never fall back to a system busy cursor.
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(80, 80, 80, 255), 8.0));
+    move_cursor(PhysicalPoint::new(761, 661));
+    pump_for(Duration::from_millis(150));
+    let fallback = current_cursor();
+    assert_eq!(
+        fallback.handle, arrow,
+        "an unmatched pen colour must fall back to the standard arrow cursor"
+    );
+    assert_ne!(fallback.handle, wait);
+    assert_ne!(fallback.handle, appstarting);
+
+    session.surface_mut().expect("ink surface").hide();
+    drop(session);
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(100));
 }
 
 #[test]
@@ -1110,6 +1267,28 @@ fn cursor_position() -> PhysicalPoint {
     PhysicalPoint::new(point.x, point.y)
 }
 
+/// The OS cursor state seen by the user (handle plus the visible flag).
+struct CursorState {
+    handle: HCURSOR,
+    shown: bool,
+}
+
+fn current_cursor() -> CursorState {
+    let mut info = CURSORINFO {
+        cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetCursorInfo(&mut info) }.expect("GetCursorInfo");
+    CursorState {
+        handle: info.hCursor,
+        shown: info.flags.0 & CURSOR_SHOWING.0 != 0,
+    }
+}
+
+fn stock_cursor(name: PCWSTR) -> HCURSOR {
+    unsafe { LoadCursorW(None, name) }.expect("load stock cursor")
+}
+
 fn move_cursor(point: PhysicalPoint) {
     let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) } as i64;
     let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) } as i64;
@@ -1381,6 +1560,35 @@ impl ScreenRegion {
             }
         });
         count
+    }
+
+    /// Fraction of 1-pixel columns inside `region` that contain a non-white
+    /// pixel. A continuous horizontal line gives ~1.0; the broken mid-drag
+    /// line of the reported bug leaves visible gaps (~0.5).
+    fn column_coverage(&self, region: PhysicalRect) -> f64 {
+        let left = (region.left - self.bounds.left).max(0);
+        let top = (region.top - self.bounds.top).max(0);
+        let right = (region.right - self.bounds.left).min(self.bounds.width());
+        let bottom = (region.bottom - self.bounds.top).min(self.bounds.height());
+        assert!(
+            right > left && bottom > top,
+            "coverage region must be non-empty"
+        );
+        let mut covered = 0usize;
+        for x in left..right {
+            let mut inked = false;
+            for y in top..bottom {
+                let [r, g, b] = self.pixel_rgb(x, y);
+                if r < 245 || g < 245 || b < 245 {
+                    inked = true;
+                    break;
+                }
+            }
+            if inked {
+                covered += 1;
+            }
+        }
+        covered as f64 / (right - left) as f64
     }
 
     /// Writes the captured pixels as a top-down 32-bit BMP for the side-by-side

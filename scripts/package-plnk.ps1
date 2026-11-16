@@ -161,7 +161,10 @@ $requiredFiles = @(
     'plnk.exe', 'license.txt', 'README-zh.txt', 'VERSION',
     'assets\icons\icon_red.ico', 'assets\icons\icon_white.ico',
     'assets\icons\pencil1.png', 'assets\icons\pencil_act.png',
-    'assets\icons\penwidth.png', 'assets\icons\penwidthpanel.png'
+    'assets\icons\penwidth.png', 'assets\icons\penwidthpanel.png',
+    'assets\icons\cursorred.ico', 'assets\icons\cursorgreen.ico',
+    'assets\icons\cursorblue.ico', 'assets\icons\cursoryellow.ico',
+    'assets\icons\cursorsnap.ico'
 )
 foreach ($relative in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $relative) -PathType Leaf)) {
@@ -171,8 +174,8 @@ foreach ($relative in $requiredFiles) {
 
 Compress-Archive -LiteralPath $package -DestinationPath $zip -CompressionLevel Optimal
 $assetCount = (Get-ChildItem -LiteralPath (Join-Path $package 'assets\icons') -File).Count
-if ($assetCount -ne 29) {
-    throw "Unexpected packaged asset count: $assetCount (expected 29)"
+if ($assetCount -ne 34) {
+    throw "Unexpected packaged asset count: $assetCount (expected 34)"
 }
 [pscustomobject]@{
     Package = $package

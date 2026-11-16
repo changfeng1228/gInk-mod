@@ -31,16 +31,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWLP_HWNDPARENT,
     GWLP_USERDATA, GetCursorPos, GetWindowLongPtrW, GetWindowLongW, GetWindowRect, LWA_ALPHA,
     RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowLongW,
-    SetWindowPos, ShowWindow, WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW,
+    SetWindowLongW, SetWindowPos, ShowWindow, WM_APP, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::{HRESULT, PCWSTR, w};
 
 use crate::gfx::Rgba8;
 use crate::gfx::composition::{Easing, WindowComposition};
 use crate::gfx::device::{GfxError, GraphicsDevice, failed};
+use crate::platform::cursor::default_class_cursor;
 use crate::platform::dpi::{PhysicalPoint, PhysicalRect};
 
 /// Message the acceptance test posts to prove its callback meter is live.
@@ -350,6 +351,11 @@ impl NativeWindow {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(window_proc),
             hInstance: HINSTANCE(instance.0),
+            // A NULL class cursor makes Windows leave the system "app
+            // starting"/wait cursor in place over the window (the reported
+            // spinning-circle bug). Every plnk window starts from the arrow;
+            // the overlay hook overrides it with the active pen cursor.
+            hCursor: default_class_cursor(),
             lpszClassName: class_name,
             ..Default::default()
         };
@@ -662,6 +668,16 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_SETCURSOR => {
+            // The overlay hook may have returned Some above with the active
+            // pen cursor. Anything else (toolbar, pen-width panel, the hidden
+            // shell or an unhandled overlay cursor) is the standard arrow:
+            // never leave the system wait/app-starting cursor showing.
+            unsafe {
+                SetCursor(Some(default_class_cursor()));
+            }
+            LRESULT(1)
+        }
         message if message == APP_CALLBACK_MESSAGE => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }

@@ -34,12 +34,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetMessageW, GetWindowLongPtrW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SetTimer, SetWindowLongPtrW, TranslateMessage, WM_APP,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN,
-    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GetMessageW, GetWindowLongPtrW, HCURSOR, HTCLIENT, MB_ICONERROR, MB_OK, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
+    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
+    WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_POINTERCAPTURECHANGED,
+    WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{Error as WindowsError, HRESULT, HSTRING, PCWSTR, w};
 
@@ -53,6 +53,7 @@ use crate::ink::dirty::DirtyRegion;
 use crate::ink::geometry::PhysicalPointF;
 use crate::ink::model::{Edit, PenStyle};
 use crate::input::{MouseNormalizer, PointerKind, PointerNormalizer};
+use crate::platform::cursor::{CanvasCursors, default_class_cursor};
 use crate::platform::dpi::PhysicalRect;
 use crate::platform::window::{MonotonicClock, current_monitor_rect, ensure_process_dpi_awareness};
 use crate::settings::{PenSettings, Settings};
@@ -621,6 +622,7 @@ impl Drop for IoWorker {
 enum SessionOp {
     SetCapture,
     ReleaseCapture,
+    SetCursor(HCURSOR),
 }
 
 /// The live drawing session: ink surface, controller and input normalizers.
@@ -636,6 +638,7 @@ pub struct InkSession {
     pen_style: PenStyle,
     pointer: PointerNormalizer,
     mouse: MouseNormalizer,
+    cursors: CanvasCursors,
     active_pointer: Option<u32>,
     mouse_down: bool,
     committed: Option<usize>,
@@ -645,12 +648,23 @@ pub struct InkSession {
 impl InkSession {
     /// Creates the overlay and starts routing its input to the session.
     pub fn new(device: &GraphicsDevice, bounds: PhysicalRect) -> Result<Box<Self>, GfxError> {
+        let cursors = match crate::assets::icon_directory() {
+            Ok(directory) => CanvasCursors::load(&directory),
+            Err(error) => {
+                // No asset directory means no original cursors; keep the app
+                // usable with the standard arrow and record the reason.
+                let mut cursors = CanvasCursors::load(std::path::Path::new(""));
+                cursors.record_warning(format!("asset directory is unavailable: {error}"));
+                cursors
+            }
+        };
         let mut session = Box::new(Self {
             surface: None,
             controller: InkController::new(),
             pen_style: PenStyle::fixed(Rgba8::new(0, 0, 0, 255), 80.0),
             pointer: PointerNormalizer::new(),
             mouse: MouseNormalizer::new(),
+            cursors,
             active_pointer: None,
             mouse_down: false,
             committed: None,
@@ -660,6 +674,16 @@ impl InkSession {
         let surface = InkSurface::new_with_hook(device, bounds, session_hook, data)?;
         session.surface = Some(surface);
         Ok(session)
+    }
+
+    /// Number of original pen-cursor files that loaded (0-4).
+    pub fn pen_cursor_count(&self) -> usize {
+        self.cursors.loaded_count()
+    }
+
+    /// Drains cursor-loading warnings for the shell log.
+    pub fn take_cursor_warnings(&mut self) -> Vec<String> {
+        self.cursors.take_warnings()
     }
 
     pub fn surface(&self) -> Option<&InkSurface> {
@@ -741,6 +765,17 @@ impl InkSession {
         lparam: LPARAM,
     ) -> (bool, Vec<SessionOp>) {
         match message {
+            WM_SETCURSOR => {
+                // Only the client area gets the pen cursor; anything else is
+                // the shared window procedure's arrow. Returning TRUE keeps
+                // DefWindowProc from restoring the class cursor.
+                if (lparam.0 & 0xFFFF) as u32 != HTCLIENT {
+                    return (false, Vec::new());
+                }
+                let color = self.pen_style.color;
+                let cursor = self.cursors.for_pen(color.r, color.g, color.b);
+                (true, vec![SessionOp::SetCursor(cursor)])
+            }
             WM_LBUTTONDOWN => {
                 let began = self.mouse_down(lparam);
                 let ops = if began {
@@ -1049,9 +1084,18 @@ unsafe fn session_hook(
             SessionOp::ReleaseCapture => unsafe {
                 let _ = ReleaseCapture();
             },
+            SessionOp::SetCursor(cursor) => unsafe {
+                SetCursor(Some(cursor));
+            },
         }
     }
-    handled.then_some(LRESULT(0))
+    // WM_SETCURSOR must return TRUE (1) to tell Windows the cursor was set;
+    // every other handled message uses the conventional zero result.
+    handled.then_some(if message == WM_SETCURSOR {
+        LRESULT(1)
+    } else {
+        LRESULT(0)
+    })
 }
 
 /// Converts a configured legacy pen width from HIMETRIC to physical pixels.
@@ -1106,6 +1150,7 @@ impl ShellWindow {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(shell_window_proc),
             hInstance: HINSTANCE(instance.0),
+            hCursor: default_class_cursor(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
@@ -1376,10 +1421,18 @@ impl Shell {
                     "graphics device missing after initialization".to_owned(),
                 ));
             };
-            let session = InkSession::new(device, bounds).map_err(|source| AppError::Graphics {
-                context: "creating the ink overlay",
-                source,
-            })?;
+            let mut session =
+                InkSession::new(device, bounds).map_err(|source| AppError::Graphics {
+                    context: "creating the ink overlay",
+                    source,
+                })?;
+            for warning in session.take_cursor_warnings() {
+                self.log.warn(&warning);
+            }
+            self.log.info(&format!(
+                "original pen cursors loaded: {}/4",
+                session.pen_cursor_count()
+            ));
             self.ink = Some(session);
             self.refresh_pen_style();
             self.log.info(&format!(

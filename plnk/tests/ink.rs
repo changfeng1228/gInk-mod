@@ -722,7 +722,7 @@ fn quadratic_width_interpolation_keeps_pressure_spikes() {
 }
 
 #[test]
-fn incremental_samples_cover_only_new_geometry_and_match_full_tail() {
+fn incremental_samples_repaint_the_cleared_tail_and_match_full_tail() {
     let style = PenStyle::pressure(Rgba8::new(0, 0, 0, 255), 40.0);
     let points: Vec<PenPoint> = (0..10)
         .map(|index| {
@@ -738,8 +738,22 @@ fn incremental_samples_cover_only_new_geometry_and_match_full_tail() {
     assert_eq!(incremental.last(), full.last());
     assert_eq!(
         incremental.first().map(|sample| sample.position),
-        Some(PhysicalPointF::new(75.0, 25.0)),
-        "the tail must start exactly where the previously rendered curve ended"
+        Some(PhysicalPointF::new(45.0, 37.5)),
+        "repainting must start one quadratic back: the dirty rect of a new \
+         point clears the previous quadratic's midpoint, so that midpoint \
+         must be redrawn"
+    );
+    // The incremental geometry is the same curve as the full stroke's tail:
+    // every repainted sample must match the full smoothing exactly (otherwise
+    // a live stroke would visibly splice two different curves together).
+    let start = full
+        .iter()
+        .position(|sample| Some(*sample) == incremental.first().copied())
+        .expect("the incremental start exists in the full curve");
+    assert_eq!(
+        &full[start..start + incremental.len()],
+        incremental.as_slice(),
+        "the repainted tail must match the full smoothed curve"
     );
     assert!(incremental.len() < full.len());
     for sample in incremental {
