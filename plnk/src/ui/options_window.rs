@@ -24,18 +24,24 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{BST_CHECKED, BST_UNCHECKED};
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetKeyState, VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT,
+    VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetDlgItem, GetMessageW, GetWindowTextW, IsDialogMessageW, IsWindow, MSG, RegisterClassExW,
+    GetDlgCtrlID, GetDlgItem, GetMessageW, GetParent, GetWindowTextW, IsDialogMessageW, IsWindow,
+    MSG, RegisterClassExW,
     SW_SHOW, SendMessageW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
-    WM_COMMAND, WM_CREATE, WM_DESTROY, WM_SETFONT, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WM_CHAR, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_KEYDOWN, WM_SETFONT, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WNDCLASSEXW, WINDOW_STYLE, WS_BORDER, WS_CAPTION, WS_CHILD, ES_READONLY,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{HSTRING, PCWSTR};
 
 use crate::hotkeys::{self, Command};
-use crate::options;
+use crate::options::{self, CaptureOutcome};
 use crate::settings::{Hotkey, Settings};
 use crate::startup;
 
@@ -111,7 +117,7 @@ pub fn show(owner: Option<HWND>, settings: &Settings) -> Result<Option<Settings>
         *slot.borrow_mut() = Some(Box::new(DialogState {
             working: settings.clone(),
             rows,
-            status: String::new(),
+            status: CAPTURE_HINT.to_owned(),
             autostart: startup::is_enabled(),
             accepted: false,
         }));
@@ -270,7 +276,7 @@ unsafe fn build_controls(hwnd: HWND) {
         }
         let edit_id = ROW_BASE + index as i32 * ROWS_PER_ENTRY;
         let edit = unsafe {
-            create_control(
+            create_hotkey_editor(
                 hwnd,
                 ControlSpec {
                     class: "EDIT",
@@ -374,6 +380,7 @@ unsafe fn build_controls(hwnd: HWND) {
             font,
         );
     }
+    unsafe { refresh_status(hwnd) };
 }
 
 /// Placement and identity of one child control. Grouped into a struct so the
@@ -539,4 +546,166 @@ unsafe fn accept(hwnd: HWND) {
         }
     });
     let _ = unsafe { DestroyWindow(hwnd) };
+}
+
+/// What the status line says before the user touches anything.
+const CAPTURE_HINT: &str =
+    "点击快捷键框后直接按键即可设定（可带 Ctrl/Alt/Shift/Win）；Backspace/Delete 清除；Enter 保存，Esc 取消";
+
+/// Creates one hotkey box: a read-only edit control that captures keystrokes.
+///
+/// A read-only `EDIT` is used rather than a custom control class because it
+/// already has what the row needs -- focus, Tab navigation through
+/// `IsDialogMessageW`, and the standard font and frame -- and because it can
+/// never mutate its own text from typed characters, so what the box shows is
+/// always exactly what the configuration holds.
+unsafe fn create_hotkey_editor(parent: HWND, spec: ControlSpec<'_>, font: HFONT) -> HWND {
+    let ControlSpec {
+        x, y, width, height, id, ..
+    } = spec;
+    let class = HSTRING::from("EDIT");
+    let empty = HSTRING::from("");
+    let edit = unsafe {
+        CreateWindowExW(
+            Default::default(),
+            &class,
+            &empty,
+            WINDOW_STYLE((WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER).0 | ES_READONLY as u32),
+            x,
+            y,
+            width,
+            height,
+            Some(parent),
+            Some(windows::Win32::UI::WindowsAndMessaging::HMENU(
+                id as isize as *mut core::ffi::c_void,
+            )),
+            None,
+            None,
+        )
+    }
+    .unwrap_or_default();
+    if edit.is_invalid() {
+        return edit;
+    }
+    unsafe {
+        let _ = SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        // The subclass owns every key pressed while this box has focus; the
+        // edit control's own editing behaviour is never needed.
+        let _ = SetWindowSubclass(edit, Some(hotkey_edit_proc), 0, 0);
+    }
+    edit
+}
+
+/// Subclass procedure for every hotkey box.
+///
+/// `WM_KEYDOWN`/`WM_SYSKEYDOWN` are the gesture itself: the modifier state is
+/// read at that instant and the whole key press is consumed, so Alt never opens
+/// the window menu and a Ctrl combination never reaches the edit control.
+/// `WM_CHAR`/`WM_SYSCHAR` are swallowed too, so a read-only box cannot under any
+/// circumstance accumulate typed text.
+unsafe extern "system" fn hotkey_edit_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let virtual_key = wparam.0 as u16;
+            let outcome = options::capture_from_vk(
+                virtual_key,
+                modifier_down(&[VK_CONTROL, VK_LCONTROL, VK_RCONTROL]),
+                modifier_down(&[VK_MENU, VK_LMENU, VK_RMENU]),
+                modifier_down(&[VK_SHIFT, VK_LSHIFT, VK_RSHIFT]),
+                modifier_down(&[VK_LWIN, VK_RWIN]),
+            );
+            // A key the model cannot bind (Tab, arrows, Space, symbols) is
+            // reported but NOT consumed: Tab must still move focus and the
+            // arrows must still be arrows. Only a key that becomes part of a
+            // combination -- or a lone modifier, which must not open the window
+            // menu -- is swallowed.
+            if matches!(outcome, CaptureOutcome::Unsupported(_)) {
+                unsafe { apply_capture(hwnd, outcome) };
+                return unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+            }
+            unsafe { apply_capture(hwnd, outcome) };
+            LRESULT(0)
+        }
+        WM_CHAR | WM_SYSCHAR => LRESULT(0),
+        _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// True while any of `keys` is held down.
+///
+/// `GetKeyState` reports this thread's view of the keyboard, which is the view
+/// the window procedure runs under, so it sees exactly the modifiers that were
+/// down when the key message was generated.
+fn modifier_down(keys: &[VIRTUAL_KEY]) -> bool {
+    keys.iter()
+        .any(|key| i32::from(unsafe { GetKeyState(i32::from(key.0)) }) < 0)
+}
+
+/// Applies one captured outcome to the row that owns `edit` and reports it.
+///
+/// The configuration is only touched through [`options::apply_hotkey`], so a
+/// captured combination gets exactly the same validation as a typed one
+/// (half-entered, system-wide modifier rule, duplicate action). The box shows
+/// the new value only when the rebind was accepted; on a rejection it keeps the
+/// old text and the status line says why.
+unsafe fn apply_capture(edit: HWND, outcome: CaptureOutcome) {
+    let edit_id = unsafe { GetDlgCtrlID(edit) };
+    let parent = unsafe { GetParent(edit) }.unwrap_or_default();
+    let (message, shown) = STATE.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(state) = guard.as_mut() else {
+            return (String::new(), None);
+        };
+        let Some(command) = state
+            .rows
+            .iter()
+            .find(|row| row.edit_id == edit_id)
+            .map(|row| row.command)
+        else {
+            return (String::new(), None);
+        };
+        match outcome {
+            CaptureOutcome::Key(hotkey) => {
+                match options::apply_hotkey(&mut state.working, command, hotkey) {
+                    Ok(()) => (String::new(), Some(hotkeys::format_hotkey(&hotkey))),
+                    Err(error) => (error.message, None),
+                }
+            }
+            CaptureOutcome::Clear => {
+                let cleared = Hotkey::default();
+                match options::apply_hotkey(&mut state.working, command, cleared) {
+                    Ok(()) => (String::new(), Some(hotkeys::format_hotkey(&cleared))),
+                    Err(error) => (error.message, None),
+                }
+            }
+            CaptureOutcome::ModifierOnly => ("按住修饰键后，再按主键".to_owned(), None),
+            CaptureOutcome::Unsupported(vk) => (
+                format!("该键不能绑定（VK 0x{vk:02X}）：只支持字母、主数字、小键盘数字和 F1–F12"),
+                None,
+            ),
+        }
+    });
+    set_status(&message);
+    if let Some(text) = shown
+        && !parent.is_invalid()
+        && let Ok(control) = unsafe { GetDlgItem(Some(parent), edit_id) }
+    {
+        let wide = HSTRING::from(text);
+        let _ = unsafe { SetWindowTextW(control, &wide) };
+    }
+    if !parent.is_invalid() {
+        unsafe { refresh_status(parent) };
+    }
 }

@@ -12,7 +12,7 @@
 
 use crate::app::AppMode;
 use crate::hotkeys::{self, Command};
-use crate::settings::{Hotkey, Settings};
+use crate::settings::{Hotkey, HotkeyKey, Settings};
 
 /// One row of the hotkey page.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +207,74 @@ fn label_for(command: Command) -> &'static str {
         .find(|(candidate, ..)| *candidate == command)
         .map(|(_, label, ..)| *label)
         .unwrap_or("某个笔")
+}
+
+/// What one keystroke means while a hotkey box has focus.
+///
+/// The settings window turns every key press into one of these four outcomes
+/// before it touches the configuration, so the decision is testable without a
+/// window: the window only reads the modifier state and shows the result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    /// A complete combination. It still has to pass [`apply_hotkey`]: a bare
+    /// key is legal for a pen row but not for a system-wide hotkey.
+    Key(Hotkey),
+    /// Backspace or Delete: bind nothing to this action.
+    Clear,
+    /// A modifier went down on its own. The capture keeps waiting for the main
+    /// key, so pressing Ctrl first does not end the gesture.
+    ModifierOnly,
+    /// The key has no [`HotkeyKey`] counterpart (arrows, Space, Esc, symbols).
+    /// The window reports it instead of binding something the user cannot see.
+    Unsupported(u16),
+}
+
+/// Maps one Win32 virtual-key code plus the live modifier state to an outcome.
+///
+/// `vk` is the `wParam` of `WM_KEYDOWN`/`WM_SYSKEYDOWN`. The four flags are the
+/// queried state of Ctrl/Alt/Shift/Win at the moment the main key went down --
+/// a combination is "whatever was held when the last key of the gesture landed",
+/// which is what the user typed and what the legacy application recorded.
+pub fn capture_from_vk(vk: u16, control: bool, alt: bool, shift: bool, win: bool) -> CaptureOutcome {
+    match vk {
+        // VK_A..VK_Z are the ASCII uppercase letters.
+        0x41..=0x5A => CaptureOutcome::Key(Hotkey {
+            control,
+            alt,
+            shift,
+            win,
+            key: Some(HotkeyKey::Letter(char::from(vk as u8))),
+        }),
+        // VK_0..VK_9 are the ASCII digits; the numpad keys sit at 0x60.
+        0x30..=0x39 => CaptureOutcome::Key(Hotkey {
+            control,
+            alt,
+            shift,
+            win,
+            key: Some(HotkeyKey::Digit((vk - 0x30) as u8)),
+        }),
+        0x60..=0x69 => CaptureOutcome::Key(Hotkey {
+            control,
+            alt,
+            shift,
+            win,
+            key: Some(HotkeyKey::NumPad((vk - 0x60) as u8)),
+        }),
+        // VK_F1..VK_F12.
+        0x70..=0x7B => CaptureOutcome::Key(Hotkey {
+            control,
+            alt,
+            shift,
+            win,
+            key: Some(HotkeyKey::Function((vk - 0x70 + 1) as u8)),
+        }),
+        0x08 | 0x2E => CaptureOutcome::Clear,
+        // Shift, Ctrl, Alt, the left/right variants, and both Win keys.
+        0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0 | 0xA1 | 0xA2 | 0xA3 | 0xA4 | 0xA5 => {
+            CaptureOutcome::ModifierOnly
+        }
+        other => CaptureOutcome::Unsupported(other),
+    }
 }
 
 fn has_modifier(hotkey: &Hotkey) -> bool {
