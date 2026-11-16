@@ -138,6 +138,12 @@ impl WindowComposition {
         })
     }
 
+    /// Device context used to create window-local D2D resources such as the
+    /// original legacy bitmap icons. The context remains owned by this window.
+    pub(crate) fn context(&self) -> &ID2D1DeviceContext {
+        &self.context
+    }
+
     pub(crate) fn fill(&mut self, color: Rgba8) -> Result<(), GfxError> {
         let transparent = D2D1_COLOR_F {
             r: 0.0,

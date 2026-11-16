@@ -5,10 +5,12 @@
 //! exit path: [`TrayIcon`]'s `Drop` and the explicit [`TrayIcon::remove`] both
 //! call `Shell_NotifyIconW(NIM_DELETE)`, so no stale icon survives an exit.
 //!
-//! The stock application icon is used until the icon assets task provides the
-//! real gInk-derived tray icons (including `White_Tray_Icon`).
+//! The original red/white gInk ICO is loaded relative to the executable and is
+//! also assigned to the hidden shell window. Missing files degrade to the stock
+//! application icon with a deferred warning for the application log.
 
 use std::fmt;
+use std::path::Path;
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Shell::{
@@ -16,17 +18,19 @@ use windows::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, HMENU, IDI_APPLICATION, LoadIconW,
-    MF_STRING, PostMessageW, SetForegroundWindow, TPM_RIGHTBUTTON, TrackPopupMenu, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, HICON, HMENU, ICON_BIG,
+    ICON_SMALL, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadIconW,
+    LoadImageW, MF_STRING, PostMessageW, SendMessageW, SetForegroundWindow, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_NULL, WM_SETICON,
 };
-use windows::core::{Error as WindowsError, w};
+use windows::core::{Error as WindowsError, PCWSTR, w};
 
 /// Command id posted by the tray menu. The same id the user selects in the
 /// popup produces the `WM_COMMAND` handled by the shell window.
 pub const MENU_EXIT: usize = 1;
 
 const TRAY_ICON_ID: u32 = 1;
-const TOOLTIP: &str = "plnk";
+pub const TRAY_TOOLTIP: &str = concat!("plnk ", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug)]
 pub struct TrayError {
@@ -59,32 +63,62 @@ impl std::error::Error for TrayError {
     }
 }
 
+/// Owned or shared icon handle. File icons are destroyed; stock icons are not.
+struct LoadedIcon {
+    handle: HICON,
+    owned: bool,
+    warning: Option<String>,
+}
+
+impl Drop for LoadedIcon {
+    fn drop(&mut self) {
+        if self.owned && !self.handle.is_invalid() {
+            let _ = unsafe { DestroyIcon(self.handle) };
+        }
+    }
+}
+
 /// The notification-area icon owned by [`TrayIcon::hwnd`].
 pub struct TrayIcon {
     hwnd: HWND,
     added: bool,
+    // Kept alive until after the shell HWND is destroyed (Shell field order).
+    _icon: LoadedIcon,
+    asset_warning: Option<String>,
 }
 
 impl TrayIcon {
     /// Adds the icon to the notification area. `callback_message` is posted to
     /// `hwnd` with mouse events in `lParam`.
-    pub fn new(hwnd: HWND, callback_message: u32) -> Result<Self, TrayError> {
-        let mut icon = Self { hwnd, added: false };
-        let stock_icon =
-            unsafe { LoadIconW(None, IDI_APPLICATION) }.map_err(|error| TrayError {
-                context: "loading the stock tray icon",
-                source: error,
-            })?;
-        let mut data = icon.base_data();
+    pub fn new(hwnd: HWND, callback_message: u32, white: bool) -> Result<Self, TrayError> {
+        let icon = match crate::assets::icon_directory() {
+            Ok(directory) => load_tray_icon(&directory, white)?,
+            Err(error) => stock_tray_icon(Some(format!(
+                "could not locate the executable asset directory: {error}; using stock tray icon"
+            )))?,
+        };
+        let asset_warning = icon.warning.clone();
+        let mut tray = Self {
+            hwnd,
+            added: false,
+            _icon: icon,
+            asset_warning,
+        };
+        let mut data = tray.base_data();
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         data.uCallbackMessage = callback_message;
-        data.hIcon = stock_icon;
-        copy_wide(&mut data.szTip, TOOLTIP);
+        data.hIcon = tray._icon.handle;
+        copy_wide(&mut data.szTip, TRAY_TOOLTIP);
+        set_window_icons(hwnd, tray._icon.handle);
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             return Err(TrayError::from_thread("adding the tray icon (NIM_ADD)"));
         }
-        icon.added = true;
-        Ok(icon)
+        tray.added = true;
+        Ok(tray)
+    }
+
+    pub fn take_asset_warning(&mut self) -> Option<String> {
+        self.asset_warning.take()
     }
 
     /// Shows the tray context menu for `hwnd` and lets Windows post the
@@ -173,6 +207,59 @@ impl Drop for TrayIcon {
     }
 }
 
+fn load_tray_icon(directory: &Path, white: bool) -> Result<LoadedIcon, TrayError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let filename = crate::assets::tray_icon_filename(white);
+    let path = directory.join(filename);
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    match unsafe {
+        LoadImageW(
+            None,
+            PCWSTR(wide.as_ptr()),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+    } {
+        Ok(handle) => Ok(LoadedIcon {
+            handle: HICON(handle.0),
+            owned: true,
+            warning: None,
+        }),
+        Err(error) => stock_tray_icon(Some(format!(
+            "legacy tray icon {} could not be loaded: {error}; using stock tray icon",
+            path.display()
+        ))),
+    }
+}
+
+fn stock_tray_icon(warning: Option<String>) -> Result<LoadedIcon, TrayError> {
+    let handle = unsafe { LoadIconW(None, IDI_APPLICATION) }.map_err(|error| TrayError {
+        context: "loading the stock tray icon fallback",
+        source: error,
+    })?;
+    Ok(LoadedIcon {
+        handle,
+        owned: false,
+        warning,
+    })
+}
+
+fn set_window_icons(hwnd: HWND, icon: HICON) {
+    for kind in [ICON_SMALL, ICON_BIG] {
+        unsafe {
+            SendMessageW(
+                hwnd,
+                WM_SETICON,
+                Some(WPARAM(kind as usize)),
+                Some(LPARAM(icon.0 as isize)),
+            )
+        };
+    }
+}
+
 fn copy_wide(buffer: &mut [u16], text: &str) {
     let encoded: Vec<u16> = text
         .encode_utf16()
@@ -181,5 +268,38 @@ fn copy_wide(buffer: &mut [u16], text: &str) {
     buffer[..encoded.len()].copy_from_slice(&encoded);
     if let Some(last) = buffer.get_mut(encoded.len()) {
         *last = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_red_and_white_icons_load_and_missing_files_use_stock_fallback() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+        for white in [false, true] {
+            let loaded = load_tray_icon(&root, white).expect("load original ICO");
+            assert!(loaded.owned, "the packaged ICO must own its HICON");
+            assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+            assert!(!loaded.handle.is_invalid());
+        }
+
+        let missing =
+            std::env::temp_dir().join(format!("plnk-missing-tray-assets-{}", std::process::id()));
+        let fallback = load_tray_icon(&missing, false).expect("stock icon fallback");
+        assert!(
+            !fallback.owned,
+            "the shared stock icon must not be destroyed"
+        );
+        assert!(!fallback.handle.is_invalid());
+        assert!(
+            fallback
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("icon_red.ico")),
+            "{:?}",
+            fallback.warning
+        );
     }
 }

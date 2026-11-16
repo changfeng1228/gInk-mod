@@ -7,6 +7,7 @@
 //! bounded logging that every later task runs inside.
 
 pub mod app;
+pub mod assets;
 pub mod error;
 pub mod gfx;
 pub mod hotkeys;

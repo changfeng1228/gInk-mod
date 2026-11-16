@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use plnk::assets::{icon_directory_for, tray_icon_filename};
 use plnk::gfx::composition::Easing;
 use plnk::platform::dpi::{DipPoint, DipRect, DpiMap, PhysicalPoint, PhysicalRect};
 use plnk::settings::Settings;
@@ -505,4 +506,59 @@ fn button_codes_roundtrip_for_the_click_notification() {
         "only ten pen slots exist"
     );
     assert_eq!(ButtonId::from_code(11), None);
+}
+
+#[test]
+fn assets_resolve_next_to_the_executable_and_select_tray_colour() {
+    let executable = std::path::Path::new(r"D:\portable\plnk-v0.1.0\plnk.exe");
+    assert_eq!(
+        icon_directory_for(executable),
+        std::path::PathBuf::from(r"D:\portable\plnk-v0.1.0\assets\icons")
+    );
+    assert_eq!(tray_icon_filename(false), "icon_red.ico");
+    assert_eq!(tray_icon_filename(true), "icon_white.ico");
+    assert_eq!(plnk::tray::TRAY_TOOLTIP, "plnk 0.1.0");
+}
+
+#[test]
+fn every_toolbar_state_maps_to_an_original_legacy_png() {
+    let expected = [
+        (Icon::Dock, "dock.png"),
+        (Icon::DockBack, "dockback.png"),
+        (Icon::Pencil, "pencil1.png"),
+        (Icon::PencilActive, "pencil_act.png"),
+        (Icon::Highlighter, "highlighter1.png"),
+        (Icon::HighlighterActive, "highlighter_act.png"),
+        (Icon::Eraser, "eraser.png"),
+        (Icon::EraserActive, "eraseract.png"),
+        (Icon::Pointer, "pointer1.png"),
+        (Icon::PointerActive, "pointer_act.png"),
+        (Icon::Pan, "pan.png"),
+        (Icon::PanActive, "pan_act.png"),
+        (Icon::PenWidth, "penwidth.png"),
+        (Icon::InkVisible, "visible.png"),
+        (Icon::InkHidden, "visible_not.png"),
+        (Icon::Snapshot, "snap.png"),
+        (Icon::Undo, "undo.png"),
+        (Icon::Clear, "garbage.png"),
+        (Icon::Exit, "exit.png"),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+    for (icon, filename) in expected {
+        assert_eq!(
+            icon.asset_name(),
+            filename,
+            "wrong legacy file for {icon:?}"
+        );
+        let bytes = std::fs::read(root.join(filename))
+            .unwrap_or_else(|error| panic!("missing {filename}: {error}"));
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "{filename} is not a PNG");
+        let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG width"));
+        let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG height"));
+        if matches!(icon, Icon::Dock | Icon::DockBack) {
+            assert_eq!((width, height), (96, 128), "legacy dock bitmap size");
+        } else {
+            assert_eq!((width, height), (128, 128), "legacy square bitmap size");
+        }
+    }
 }

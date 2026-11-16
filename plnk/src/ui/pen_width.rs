@@ -22,7 +22,7 @@ use crate::gfx::device::{GfxError, GraphicsDevice, failed};
 use crate::platform::dpi::{DpiMap, PhysicalRect};
 use crate::platform::window::NativeWindow;
 use crate::settings::Rgb;
-use crate::ui::icons::Canvas;
+use crate::ui::icons::{Canvas, load_legacy_bitmap};
 
 pub const PANEL_WIDTH_DIP: f32 = 300.0;
 pub const PANEL_HEIGHT_DIP: f32 = 80.0;
@@ -76,7 +76,8 @@ enum Op {
 }
 
 struct PenWidthUi {
-    // Released before the HWND, matching the other composition windows.
+    // The bitmap is released before its context; composition precedes the HWND.
+    panel_bitmap: Option<windows::Win32::Graphics::Direct2D::ID2D1Bitmap>,
     composition: Option<WindowComposition>,
     window: Option<NativeWindow>,
     model: PenWidthModel,
@@ -86,11 +87,13 @@ struct PenWidthUi {
     dragging: bool,
     notify: Option<(HWND, u32)>,
     last_error: Option<String>,
+    asset_warnings: Vec<String>,
 }
 
 impl PenWidthUi {
     fn render(&mut self) -> Result<(), GfxError> {
         let Self {
+            panel_bitmap,
             composition,
             model,
             dpi,
@@ -108,30 +111,40 @@ impl PenWidthUi {
                 [0.0, 0.0, PANEL_WIDTH_DIP * scale, PANEL_HEIGHT_DIP * scale],
                 paper,
             )?;
-            // A thin track and three width exemplars, drawn with D2D instead of
-            // the legacy bitmap. The orange full-height indicator matches the
-            // legacy pboxPenWidthIndicator interaction and position.
-            let y = PANEL_HEIGHT_DIP * 0.5 * scale;
-            canvas.fill_rect(
-                [
-                    MARGIN_DIP * scale,
-                    y - 1.0,
-                    (PANEL_WIDTH_DIP - MARGIN_DIP) * scale,
-                    y + 1.0,
-                ],
-                Rgb::new(80, 80, 80),
-            )?;
-            for (x, half_height) in [(55.0, 5.0), (150.0, 12.0), (245.0, 20.0)] {
+            if let Some(bitmap) = panel_bitmap.as_ref() {
+                // Legacy BackgroundImageLayout.Center: the original 200x53
+                // image stays centred in the 300x80 panel rather than stretching.
+                canvas.draw_bitmap(
+                    bitmap,
+                    [50.0 * scale, 13.5 * scale, 250.0 * scale, 66.5 * scale],
+                )?;
+            } else {
+                // Missing-asset fallback: retain the earlier native track and
+                // exemplars instead of leaving the slider visually blank.
+                let y = PANEL_HEIGHT_DIP * 0.5 * scale;
                 canvas.fill_rect(
                     [
-                        x * scale,
-                        y - half_height * scale,
-                        (x + 4.0) * scale,
-                        y + half_height * scale,
+                        MARGIN_DIP * scale,
+                        y - 1.0,
+                        (PANEL_WIDTH_DIP - MARGIN_DIP) * scale,
+                        y + 1.0,
                     ],
-                    Rgb::new(0, 0, 0),
+                    Rgb::new(80, 80, 80),
                 )?;
+                for (x, half_height) in [(55.0, 5.0), (150.0, 12.0), (245.0, 20.0)] {
+                    canvas.fill_rect(
+                        [
+                            x * scale,
+                            y - half_height * scale,
+                            (x + 4.0) * scale,
+                            y + half_height * scale,
+                        ],
+                        Rgb::new(0, 0, 0),
+                    )?;
+                }
             }
+            // The orange full-height indicator matches the legacy
+            // pboxPenWidthIndicator interaction and position.
             let centre = indicator_x * scale;
             let half = INDICATOR_WIDTH_DIP * 0.5 * scale;
             let orange = canvas.solid(Rgb::new(255, 165, 0))?;
@@ -203,6 +216,8 @@ impl PenWidthPanel {
         let dpi = DpiMap::from_window(owner);
         let rect = panel_size_rect(dpi, 0, 0);
         let mut ui = Box::new(PenWidthUi {
+            panel_bitmap: None,
+            asset_warnings: Vec::new(),
             composition: None,
             window: None,
             model: PenWidthModel::default(),
@@ -228,6 +243,21 @@ impl PenWidthPanel {
             rect.width() as u32,
             rect.height() as u32,
         )?;
+        match crate::assets::icon_directory() {
+            Ok(directory) => {
+                let path = directory.join("penwidthpanel.png");
+                match load_legacy_bitmap(composition.context(), &path) {
+                    Ok(bitmap) => ui.panel_bitmap = Some(bitmap),
+                    Err(error) => ui.asset_warnings.push(format!(
+                        "legacy pen-width panel {} could not be loaded: {error}; using vector fallback",
+                        path.display()
+                    )),
+                }
+            }
+            Err(error) => ui.asset_warnings.push(format!(
+                "could not locate pen-width panel assets: {error}; using vector fallback"
+            )),
+        }
         ui.dpi = DpiMap::from_window(window.hwnd());
         ui.window = Some(window);
         ui.composition = Some(composition);
@@ -260,6 +290,14 @@ impl PenWidthPanel {
 
     pub fn take_error(&mut self) -> Option<String> {
         self.ui.last_error.take()
+    }
+
+    pub fn legacy_panel_bitmap_loaded(&self) -> bool {
+        self.ui.panel_bitmap.is_some()
+    }
+
+    pub fn take_asset_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ui.asset_warnings)
     }
 
     /// Centers the 300×80 DIP panel over the pen-width button, 10 DIP above
@@ -378,5 +416,17 @@ mod tests {
         assert_eq!(model.update_from_x(120.0), Some(480.0));
         assert!((model.indicator_x() - 120.0).abs() < 1e-4);
         assert!((model.update_from_x(290.0).unwrap_or_default() - 2_803.333_3).abs() < 1e-3);
+    }
+
+    #[test]
+    #[ignore = "creates a real Direct2D device and decodes the legacy panel"]
+    fn popup_loads_the_original_pen_width_panel_bitmap() {
+        let device = crate::gfx::device::GraphicsDevice::new().expect("graphics device");
+        let context = device.create_device_context().expect("device context");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons/penwidthpanel.png");
+        let bitmap = super::load_legacy_bitmap(&context, &path).expect("legacy panel PNG");
+        assert_eq!(unsafe { bitmap.GetSize() }.width, 200.0);
+        assert_eq!(unsafe { bitmap.GetSize() }.height, 53.0);
     }
 }

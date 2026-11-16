@@ -48,7 +48,7 @@ use crate::platform::window::{
 };
 use crate::settings::{MAX_PEN_COUNT, Settings};
 use crate::ui::animation::{SlidePlan, ToolbarAnimator};
-use crate::ui::icons::{Canvas, draw_icon, icon_for};
+use crate::ui::icons::{Canvas, IconBitmaps, draw_icon, icon_for};
 
 /// Number of configurable pen buttons (legacy `Root.MaxPenCount`).
 pub const MAX_PEN_BUTTONS: usize = MAX_PEN_COUNT;
@@ -636,6 +636,8 @@ impl ToolbarWindow {
         let monitor = monitor_geometry(provisional_origin);
         let placeholder_layout = ToolbarLayout::new(&model, 64.0, false);
         let mut ui = Box::new(ToolbarUi {
+            bitmaps: None,
+            asset_warnings: Vec::new(),
             composition: None,
             window: None,
             model,
@@ -683,6 +685,9 @@ impl ToolbarWindow {
         set_window_rect_raw(hwnd, rect)?;
         let composition =
             WindowComposition::new(device, hwnd, rect.width() as u32, rect.height() as u32)?;
+        let bitmaps = IconBitmaps::load(composition.context());
+        ui.asset_warnings = bitmaps.warnings().to_vec();
+        ui.bitmaps = Some(bitmaps);
         ui.composition = Some(composition);
         ui.render()?;
         Ok(Self {
@@ -804,6 +809,16 @@ impl ToolbarWindow {
         self.ui.last_error.take()
     }
 
+    /// Number of original PNG states decoded for this window (0-19).
+    pub fn legacy_bitmap_count(&self) -> usize {
+        self.ui.bitmaps.as_ref().map_or(0, IconBitmaps::len)
+    }
+
+    /// Deferred asset warnings for the application log.
+    pub fn take_asset_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ui.asset_warnings)
+    }
+
     /// Slides the toolbar in (300 ms, legacy `ButtonsEntering = 1`).
     pub fn enter(&mut self) -> Result<(), GfxError> {
         let ops = self.ui.op_enter();
@@ -880,8 +895,9 @@ enum Op {
 }
 
 struct ToolbarUi {
-    // Declared before `window`: the composition target must be released before
-    // the HWND is destroyed.
+    // Bitmaps are released before their device context; the composition target
+    // is released before the HWND is destroyed.
+    bitmaps: Option<IconBitmaps>,
     composition: Option<WindowComposition>,
     window: Option<NativeWindow>,
     model: ToolbarModel,
@@ -906,6 +922,7 @@ struct ToolbarUi {
     visible: bool,
     settle: Settle,
     last_error: Option<String>,
+    asset_warnings: Vec<String>,
 }
 
 impl ToolbarUi {
@@ -947,6 +964,7 @@ impl ToolbarUi {
 
     fn render(&mut self) -> Result<(), GfxError> {
         let Self {
+            bitmaps,
             composition,
             model,
             layout,
@@ -963,7 +981,15 @@ impl ToolbarUi {
         let strip = *strip_view;
         composition.draw(|context, factory| {
             let canvas = Canvas::new(context, factory)?;
-            render_view(&canvas, layout, model, docked, strip, scale)
+            render_view(
+                &canvas,
+                layout,
+                model,
+                docked,
+                strip,
+                scale,
+                bitmaps.as_ref(),
+            )
         })
     }
 
@@ -1355,6 +1381,7 @@ fn render_view(
     docked: bool,
     strip: bool,
     scale: f32,
+    bitmaps: Option<&IconBitmaps>,
 ) -> Result<(), GfxError> {
     let (width, height) = layout.size();
     canvas.fill_rect([0.0, 0.0, width * scale, height * scale], PAPER)?;
@@ -1372,7 +1399,7 @@ fn render_view(
             draw_pen_face(canvas, *index, physical, scale, model)?;
         }
         let icon = icon_for(*id, model, docked);
-        draw_icon(canvas, icon, physical)?;
+        draw_icon(canvas, icon, physical, bitmaps)?;
     }
     Ok(())
 }

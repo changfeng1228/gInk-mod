@@ -1,24 +1,31 @@
-//! Toolbar icons drawn with Direct2D primitives.
+//! Original gInk toolbar bitmaps decoded through WIC and drawn by Direct2D.
 //!
-//! The legacy gInk toolbar used 128x128 PNG bitmaps (`src/pencil1.png`,
-//! `src/eraser.png`, ...) scaled into square buttons. The rewrite redraws the
-//! same shapes as vector geometry so the toolbar needs no image decoder and no
-//! asset packaging yet: ink-black inactive icons, the legacy gold
-//! `RGB(239,192,67)` active state, the red crossed-eye for hidden ink and the
-//! dock chevrons. The pen buttons keep the legacy trick where a transparent
-//! horizontal stripe near the bottom of the pencil bitmap lets the button's pen
-//! colour show through as an underline.
+//! The legacy gInk toolbar uses 128x128 PNG bitmaps (`pencil1.png`,
+//! `eraser.png`, ...) scaled into its native buttons. `IconBitmaps` owns the
+//! decoded D2D resources for one window. A missing or damaged asset is reported
+//! and falls back to the previous vector geometry, so asset packaging problems
+//! never prevent annotation. The pen buttons retain the legacy transparent
+//! stripe through which the configured pen colour is visible.
 
+use std::path::Path;
+
+use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
     D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_CAP_STYLE_ROUND, D2D1_ELLIPSE,
-    D2D1_LINE_JOIN_ROUND, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
-    D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Brush, ID2D1DeviceContext, ID2D1Factory1,
-    ID2D1SolidColorBrush,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_LINE_JOIN_ROUND, D2D1_ROUNDED_RECT,
+    D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Bitmap, ID2D1Brush,
+    ID2D1DeviceContext, ID2D1Factory1, ID2D1SolidColorBrush,
 };
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
+    WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnLoad,
+};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::core::PCWSTR;
 use windows_numerics::{Matrix3x2, Vector2};
 
 use crate::gfx::device::{GfxError, failed};
@@ -59,6 +66,171 @@ pub enum Icon {
     Undo,
     Clear,
     Exit,
+}
+
+impl Icon {
+    pub const ALL: [Self; 19] = [
+        Self::Dock,
+        Self::DockBack,
+        Self::Pencil,
+        Self::PencilActive,
+        Self::Highlighter,
+        Self::HighlighterActive,
+        Self::Eraser,
+        Self::EraserActive,
+        Self::Pointer,
+        Self::PointerActive,
+        Self::Pan,
+        Self::PanActive,
+        Self::PenWidth,
+        Self::InkVisible,
+        Self::InkHidden,
+        Self::Snapshot,
+        Self::Undo,
+        Self::Clear,
+        Self::Exit,
+    ];
+
+    /// Original gInk PNG used for this toolbar state.
+    pub const fn asset_name(self) -> &'static str {
+        match self {
+            Self::Dock => "dock.png",
+            Self::DockBack => "dockback.png",
+            Self::Pencil => "pencil1.png",
+            Self::PencilActive => "pencil_act.png",
+            Self::Highlighter => "highlighter1.png",
+            Self::HighlighterActive => "highlighter_act.png",
+            Self::Eraser => "eraser.png",
+            Self::EraserActive => "eraseract.png",
+            Self::Pointer => "pointer1.png",
+            Self::PointerActive => "pointer_act.png",
+            Self::Pan => "pan.png",
+            Self::PanActive => "pan_act.png",
+            Self::PenWidth => "penwidth.png",
+            Self::InkVisible => "visible.png",
+            Self::InkHidden => "visible_not.png",
+            Self::Snapshot => "snap.png",
+            Self::Undo => "undo.png",
+            Self::Clear => "garbage.png",
+            Self::Exit => "exit.png",
+        }
+    }
+}
+
+/// Window-local decoded originals. `None` entries select the vector fallback.
+pub(crate) struct IconBitmaps {
+    bitmaps: [Option<ID2D1Bitmap>; 19],
+    warnings: Vec<String>,
+}
+
+impl IconBitmaps {
+    pub(crate) fn load(context: &ID2D1DeviceContext) -> Self {
+        match crate::assets::icon_directory() {
+            Ok(directory) => Self::load_from(context, &directory),
+            Err(error) => Self {
+                bitmaps: std::array::from_fn(|_| None),
+                warnings: vec![format!(
+                    "could not locate the executable asset directory: {error}; using vector icons"
+                )],
+            },
+        }
+    }
+
+    fn load_from(context: &ID2D1DeviceContext, directory: &Path) -> Self {
+        let mut bitmaps: [Option<ID2D1Bitmap>; 19] = std::array::from_fn(|_| None);
+        let mut warnings = Vec::new();
+        match BitmapLoader::new() {
+            Ok(loader) => {
+                for icon in Icon::ALL {
+                    let path = directory.join(icon.asset_name());
+                    match loader.load(context, &path) {
+                        Ok(bitmap) => bitmaps[icon as usize] = Some(bitmap),
+                        Err(error) => warnings.push(format!(
+                            "legacy icon {} could not be loaded: {error}; using vector fallback",
+                            path.display()
+                        )),
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "WIC could not be initialized: {error}; using vector toolbar icons"
+            )),
+        }
+        Self { bitmaps, warnings }
+    }
+
+    pub(crate) fn get(&self, icon: Icon) -> Option<&ID2D1Bitmap> {
+        self.bitmaps[icon as usize].as_ref()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bitmaps
+            .iter()
+            .filter(|bitmap| bitmap.is_some())
+            .count()
+    }
+
+    pub(crate) fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+}
+
+struct BitmapLoader {
+    factory: IWICImagingFactory,
+}
+
+impl BitmapLoader {
+    fn new() -> Result<Self, windows::core::Error> {
+        let factory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) }?;
+        Ok(Self { factory })
+    }
+
+    fn load(&self, context: &ID2D1DeviceContext, path: &Path) -> Result<ID2D1Bitmap, String> {
+        use std::os::windows::ffi::OsStrExt;
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let decoder = unsafe {
+            self.factory.CreateDecoderFromFilename(
+                PCWSTR(wide.as_ptr()),
+                None,
+                GENERIC_READ,
+                WICDecodeMetadataCacheOnLoad,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        let frame = unsafe { decoder.GetFrame(0) }.map_err(|error| error.to_string())?;
+        let converter =
+            unsafe { self.factory.CreateFormatConverter() }.map_err(|error| error.to_string())?;
+        unsafe {
+            converter.Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+        }
+        .map_err(|error| error.to_string())?;
+        // Direct2D creates its own resource from the converted pixels. The WIC
+        // decoder, frame and converter can therefore all be released on return.
+        unsafe { context.CreateBitmapFromWicBitmap(&converter, None) }
+            .map_err(|error| error.to_string())
+            .and_then(|bitmap| {
+                windows::core::Interface::cast(&bitmap).map_err(|error| error.to_string())
+            })
+    }
+}
+
+/// Loads one additional window-local legacy bitmap (the pen-width panel).
+pub(crate) fn load_legacy_bitmap(
+    context: &ID2D1DeviceContext,
+    path: &Path,
+) -> Result<ID2D1Bitmap, String> {
+    BitmapLoader::new()
+        .map_err(|error| error.to_string())?
+        .load(context, path)
 }
 
 /// Resolves the icon state for `button`.
@@ -187,6 +359,27 @@ impl<'a> Canvas<'a> {
         brush: &ID2D1SolidColorBrush,
     ) -> Result<(), GfxError> {
         self.fill_rect_with(rect, brush)
+    }
+
+    /// Draws an original PNG into the exact physical button rectangle.
+    pub(crate) fn draw_bitmap(&self, bitmap: &ID2D1Bitmap, rect: [f32; 4]) -> Result<(), GfxError> {
+        let destination = D2D_RECT_F {
+            left: rect[0],
+            top: rect[1],
+            right: rect[2],
+            bottom: rect[3],
+        };
+        unsafe {
+            self.context.DrawBitmap(
+                bitmap,
+                Some(&destination),
+                1.0,
+                D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                None,
+                None,
+            );
+        }
+        Ok(())
     }
 
     fn fill_rect_with(&self, rect: [f32; 4], brush: &ID2D1SolidColorBrush) -> Result<(), GfxError> {
@@ -400,8 +593,20 @@ impl IconBox {
     }
 }
 
-/// Draws one icon inside a physical-pixel button rectangle.
-pub(crate) fn draw_icon(canvas: &Canvas<'_>, icon: Icon, rect: [f32; 4]) -> Result<(), GfxError> {
+/// Draws the original bitmap when available, otherwise the vector fallback.
+pub(crate) fn draw_icon(
+    canvas: &Canvas<'_>,
+    icon: Icon,
+    rect: [f32; 4],
+    bitmaps: Option<&IconBitmaps>,
+) -> Result<(), GfxError> {
+    if let Some(bitmap) = bitmaps.and_then(|assets| assets.get(icon)) {
+        return canvas.draw_bitmap(bitmap, rect);
+    }
+    draw_vector_icon(canvas, icon, rect)
+}
+
+fn draw_vector_icon(canvas: &Canvas<'_>, icon: Icon, rect: [f32; 4]) -> Result<(), GfxError> {
     let b = IconBox::new(rect);
     match icon {
         Icon::Pencil => pencil(canvas, &b, INK),
@@ -621,5 +826,32 @@ fn dock_chevron(canvas: &Canvas<'_>, b: &IconBox, back: bool) -> Result<(), GfxE
     } else {
         canvas.line(b.point(0.34, 0.18), b.point(0.66, 0.5), width, INK)?;
         canvas.line(b.point(0.66, 0.5), b.point(0.34, 0.82), width, INK)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::device::GraphicsDevice;
+
+    #[test]
+    #[ignore = "creates a real Direct2D device and decodes WIC assets"]
+    fn wic_loads_every_legacy_icon_and_missing_assets_degrade() {
+        let device = GraphicsDevice::new().expect("graphics device");
+        let context = device.create_device_context().expect("device context");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+        let loaded = IconBitmaps::load_from(&context, &root);
+        assert_eq!(loaded.len(), Icon::ALL.len());
+        assert!(loaded.warnings().is_empty(), "{:?}", loaded.warnings());
+
+        let missing = std::env::temp_dir().join(format!(
+            "plnk-missing-icons-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let fallback = IconBitmaps::load_from(&context, &missing);
+        assert_eq!(fallback.len(), 0);
+        assert_eq!(fallback.warnings().len(), Icon::ALL.len());
+        assert!(fallback.get(Icon::Pencil).is_none());
     }
 }

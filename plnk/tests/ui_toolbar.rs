@@ -57,6 +57,15 @@ fn toolbar_slides_exits_and_docks_without_per_frame_callbacks() {
     let origin = PhysicalPoint::new(400, 900);
     let mut toolbar =
         ToolbarWindow::new_at(&device, &settings, origin).expect("create native toolbar");
+    assert_eq!(
+        toolbar.legacy_bitmap_count(),
+        19,
+        "the real toolbar must decode all original legacy PNG states"
+    );
+    assert!(
+        toolbar.take_asset_warnings().is_empty(),
+        "packaged legacy assets must load without fallback warnings"
+    );
     let dpi = DpiMap::from_window(toolbar.hwnd());
     let panel = toolbar.panel_rect();
     let strip = toolbar.dock_strip_rect();
@@ -185,6 +194,34 @@ fn toolbar_slides_exits_and_docks_without_per_frame_callbacks() {
             "{id:?} must draw a dark icon"
         );
     }
+
+    // The active pencil must contain the original bitmap's WhiteSmoke body
+    // and black selection dot, not the old pure-white vector active treatment.
+    let active_pen = toolbar
+        .button_screen_rect(ButtonId::Pen(1))
+        .expect("active pen visible");
+    // Source-derived interior sample: pencil_act.png (40,80) is WhiteSmoke
+    // (245) over the same WhiteSmoke button face. The old vector active body
+    // was pure white, so this catches a fallback/regression at a stable point
+    // away from resampling edges.
+    let active_body = region.pixel_rgb(
+        active_pen.left - panel.left + active_pen.width() * 40 / 128,
+        active_pen.top - panel.top + active_pen.height() * 80 / 128,
+    );
+    assert!(
+        active_body
+            .iter()
+            .all(|channel| (238..=248).contains(channel)),
+        "selected pencil must use the original WhiteSmoke body, got {active_body:?}"
+    );
+    let active_dot = region.pixel_rgb(
+        active_pen.left - panel.left + active_pen.width() * 40 / 128,
+        active_pen.top - panel.top + active_pen.height() * 15 / 128,
+    );
+    assert!(
+        active_dot.iter().all(|channel| *channel < 60),
+        "the original active bitmap's black selection dot must remain visible, got {active_dot:?}"
+    );
 
     // --- 3) Fast exit: 160 ms, measured frames, then hidden ----------------
     let before_exit = toolbar.callback_counts();

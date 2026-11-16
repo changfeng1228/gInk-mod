@@ -1222,8 +1222,15 @@ impl Shell {
     }
 
     fn start_services(&mut self, hwnd: HWND) -> Result<(), AppError> {
-        self.tray = Some(TrayIcon::new(hwnd, TRAY_CALLBACK_MESSAGE)?);
-        self.log.info("tray icon added");
+        let mut tray = TrayIcon::new(hwnd, TRAY_CALLBACK_MESSAGE, self.settings.white_tray_icon)?;
+        if let Some(warning) = tray.take_asset_warning() {
+            self.log.warn(&warning);
+        }
+        self.tray = Some(tray);
+        self.log.info(&format!(
+            "tray icon added (legacy {} ICO)",
+            crate::assets::tray_icon_filename(self.settings.white_tray_icon)
+        ));
 
         let map = HotkeyMap::from_settings(&self.settings);
         let (hotkeys, report) = GlobalHotkeys::register(&map, Some(hwnd), !self.options.no_hotkeys);
@@ -1404,6 +1411,13 @@ impl Shell {
             if let Some(window) = self.window.as_ref() {
                 toolbar.set_click_notifier(window.hwnd(), TOOLBAR_CLICK_MESSAGE);
             }
+            for warning in toolbar.take_asset_warnings() {
+                self.log.warn(&warning);
+            }
+            self.log.info(&format!(
+                "original toolbar bitmaps loaded: {}/19",
+                toolbar.legacy_bitmap_count()
+            ));
             self.toolbar = Some(toolbar);
             self.log.info("toolbar window created");
         }
@@ -1425,6 +1439,13 @@ impl Shell {
             if let Some(window) = self.window.as_ref() {
                 panel.set_change_notifier(window.hwnd(), PEN_WIDTH_CHANGE_MESSAGE);
             }
+            for warning in panel.take_asset_warnings() {
+                self.log.warn(&warning);
+            }
+            self.log.info(&format!(
+                "original pen-width panel bitmap loaded: {}",
+                panel.legacy_panel_bitmap_loaded()
+            ));
             self.pen_width = Some(panel);
             self.log.info("pen-width popup created");
         }
@@ -1737,7 +1758,7 @@ impl Shell {
         }
         self.completions = None;
 
-        if let Some(mut tray) = self.tray.take() {
+        if let Some(tray) = self.tray.as_mut() {
             let removed = tray.remove();
             self.log.info(if removed {
                 "tray icon removed"
