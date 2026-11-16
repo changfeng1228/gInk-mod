@@ -138,16 +138,15 @@ plnk $Version（Windows 64 位便携版）
 1. 双击 plnk.exe。通知区域会显示原版红色 plnk 图标；左键单击它进入标注模式。
 2. 按住鼠标左键绘制。工具栏可选择画笔颜色、撤销、清空；工具栏最右侧 X 或 Esc 退出标注并返回托盘。
 3. 右键单击托盘图标，选择 Exit 退出程序。Esc 只退出标注，不会退出整个程序。
-4. 笔宽按钮为三条斜线。点击后在上方滑块拖动，松开关闭；第一次 Esc 关闭滑块，第二次 Esc 退出标注。
-   若配置未显示该按钮，可用 plnk.exe --pen-width 临时启用。
+4. 笔宽按钮为三条斜线，本 MVP 版本始终显示。点击后在上方滑块拖动，松开关闭；第一次 Esc 关闭滑块，第二次 Esc 退出标注。
 5. 为避免与正在运行的旧版 gInk 抢全局热键，可使用：
    plnk.exe --no-hotkeys
-   也可组合：plnk.exe --no-hotkeys --pen-width
 
 当前版本
 - 版本号 $Version；exe 已嵌入 FileVersion/ProductVersion $expectedFileVersion 和原版红色图标。
 - 工具栏使用原版 gInk PNG 位图，托盘使用 icon_red.ico；White_Tray_Icon=True 时使用 icon_white.ico。
 - 笔宽面板使用原版 penwidthpanel.png；无需安装，不修改启动项。
+- 本 MVP 暂时始终显示笔宽按钮（配置项仍会照常读取和保存；选项窗口实现后恢复按配置显示）。
 - 资源位于 exe 旁的 assets\icons。缺少资源时记录警告并回退，不会因此崩溃。
 - 可写时配置和 plnk.log 位于 exe 旁 data；否则使用 %LOCALAPPDATA%\plnk。
 

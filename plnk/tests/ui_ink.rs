@@ -2068,21 +2068,14 @@ fn wait_for_log_contains(
 }
 
 fn real_toolbar_button_center(toolbar: HWND, button: ButtonId) -> POINT {
-    real_toolbar_button_center_with_width(toolbar, button, false)
-}
-
-fn real_toolbar_button_center_with_width(
-    toolbar: HWND,
-    button: ButtonId,
-    pen_width: bool,
-) -> POINT {
     let mut rect = windows::Win32::Foundation::RECT::default();
     unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(toolbar, &mut rect) }
         .expect("toolbar rect");
     let dpi = plnk::platform::dpi::DpiMap::from_window(toolbar);
-    let mut settings = Settings::defaults();
-    settings.pen_width_icon = pen_width;
-    let model = ToolbarModel::from_settings(&settings);
+    // `--draw` without a legacy settings.ini imports the code defaults, whose
+    // `Pen_Width_Icon` is False like the legacy factory file. The MVP policy
+    // must still place the pen-width button in this real toolbar.
+    let model = ToolbarModel::from_settings(&Settings::defaults());
     let layout = plnk::ui::toolbar::ToolbarLayout::new(
         &model,
         (rect.bottom - rect.top) as f32 / dpi.scale(),
@@ -2090,27 +2083,40 @@ fn real_toolbar_button_center_with_width(
     );
     let button = layout
         .button_rect(button)
-        .expect("button in the real toolbar layout");
+        .expect("button in the real toolbar layout (MVP: pen width always visible)");
     POINT {
         x: rect.left + ((button.left + button.right) * 0.5 * dpi.scale()) as i32,
         y: rect.top + ((button.top + button.bottom) * 0.5 * dpi.scale()) as i32,
     }
 }
 
+/// Last `active pen width: X physical px` value logged since `start`.
+fn last_active_pen_width(path: &std::path::Path, start: u64) -> Option<f32> {
+    app_log_since(path, start)
+        .lines()
+        .filter_map(|line| {
+            let rest = line.split("active pen width: ").nth(1)?;
+            rest.split(" physical px").next()?.trim().parse().ok()
+        })
+        .next_back()
+}
+
 #[test]
 #[ignore = "uses real mouse drags on the pen-width slider and real Esc keys"]
 fn real_app_pen_width_slider_and_escape_priority_work() {
+    // This test computes window rectangles and injects absolute input itself,
+    // so its own process must see physical pixels like pmv2 plnk windows;
+    // otherwise the slider drag lands at virtualized coordinates.
+    plnk::platform::window::ensure_process_dpi_awareness()
+        .expect("per-monitor-v2 DPI awareness for real input");
     let exe = env!("CARGO_BIN_EXE_plnk");
     let log_path = app_log_path(exe);
     let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
+    // Deliberately no `--pen-width`: the user's imported legacy config has
+    // `Pen_Width_Icon = False`, so the MVP must expose the button for default
+    // settings too. With the button absent this test fails while locating it.
     let mut child = Command::new(exe)
-        .args([
-            "--no-hotkeys",
-            "--draw",
-            "--pen-width",
-            "--exit-after-ms",
-            "30000",
-        ])
+        .args(["--no-hotkeys", "--draw", "--exit-after-ms", "30000"])
         .spawn()
         .expect("spawn plnk.exe");
     let toolbar = wait_for_window(
@@ -2121,7 +2127,27 @@ fn real_app_pen_width_slider_and_escape_priority_work() {
     .expect("toolbar");
     pump_for(Duration::from_millis(600));
 
-    let button = real_toolbar_button_center_with_width(toolbar, ButtonId::PenWidth, true);
+    assert!(
+        wait_for_log_contains(
+            &log_path,
+            log_start,
+            "active pen width: ",
+            Duration::from_secs(3)
+        ),
+        "drawing startup must apply the active pen width; log:\n{}",
+        app_log_since(&log_path, log_start)
+    );
+    let initial_width =
+        last_active_pen_width(&log_path, log_start).expect("initial active pen width");
+
+    let button = real_toolbar_button_center(toolbar, ButtonId::PenWidth);
+    assert_eq!(
+        unsafe { windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(button) },
+        toolbar,
+        "the pen-width button must be displayed and routed to the toolbar at ({}, {})",
+        button.x,
+        button.y
+    );
     move_cursor(PhysicalPoint::new(button.x, button.y));
     pump_for(Duration::from_millis(50));
     mouse_button(true);
@@ -2175,6 +2201,13 @@ fn real_app_pen_width_slider_and_escape_priority_work() {
             Duration::from_secs(3)
         ),
         "480 HIMETRIC at 144 DPI must become 27.213 physical px; log:\n{}",
+        app_log_since(&log_path, log_start)
+    );
+    let applied_width =
+        last_active_pen_width(&log_path, log_start).expect("active pen width after the drag");
+    assert!(
+        (applied_width - 27.213).abs() < 0.001 && applied_width != initial_width,
+        "dragging must change the applied pen width ({initial_width} -> {applied_width} physical px); log:\n{}",
         app_log_since(&log_path, log_start)
     );
     assert!(
@@ -2516,7 +2549,9 @@ fn legacy_toolbar_button_center(button: ButtonId) -> POINT {
     let mut settings = Settings::defaults();
     settings.toolbar_height = 0.05;
     settings.pen_width_icon = false;
-    let model = ToolbarModel::from_settings(&settings);
+    // The legacy instance honours Pen_Width_Icon=False; use the parity model,
+    // not plnk's MVP visibility policy, so Exit is at the legacy position.
+    let model = ToolbarModel::from_settings_legacy(&settings);
     let height_dip = monitor.height() as f32 / scale * settings.toolbar_height;
     let layout = plnk::ui::toolbar::ToolbarLayout::new(&model, height_dip, false);
     let panel_width = (layout.panel_width() * scale).round() as i32;

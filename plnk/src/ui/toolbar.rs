@@ -53,6 +53,27 @@ use crate::ui::icons::{Canvas, IconBitmaps, draw_icon, icon_for};
 /// Number of configurable pen buttons (legacy `Root.MaxPenCount`).
 pub const MAX_PEN_BUTTONS: usize = MAX_PEN_COUNT;
 
+/// MVP policy: always expose the pen-width button.
+///
+/// The options UI (Task 9) does not exist yet, so a user whose imported legacy
+/// config contains `Pen_Width_Icon = False` (the factory default, and the
+/// value in existing gInk installations) has no in-app way to re-enable the
+/// button, which makes the pen width impossible to adjust. Until Task 9 lands,
+/// the button is therefore always shown and the width slider always applies;
+/// the setting itself keeps being parsed, imported and saved for that future
+/// restore. When the options UI ships, set this to `false` and gate the button
+/// on [`pen_width_visible`] again.
+const PEN_WIDTH_ALWAYS_VISIBLE: bool = true;
+
+/// Whether the toolbar exposes the pen-width button.
+///
+/// The application also uses this to decide whether the slider's
+/// session-global HIMETRIC width overrides per-pen widths: an exposed slider
+/// that did not change the applied width would repeat the user-facing bug.
+pub fn pen_width_visible(settings: &Settings) -> bool {
+    settings.pen_width_icon || PEN_WIDTH_ALWAYS_VISIBLE
+}
+
 /// Legacy drag threshold in physical pixels (`FormCollection` checks > 20).
 const DRAG_THRESHOLD: i32 = 20;
 /// Legacy 15 px bottom margin for the default position.
@@ -142,7 +163,8 @@ pub struct ToolbarModel {
 }
 
 impl ToolbarModel {
-    /// The enabled buttons in legacy visual order.
+    /// The enabled buttons in legacy visual order, with the MVP pen-width
+    /// policy applied (see [`PEN_WIDTH_ALWAYS_VISIBLE`]).
     ///
     /// Only buttons that exist in the legacy toolbar are produced: pens in
     /// index order, eraser, pan, pointer, pen width, ink visible, snapshot,
@@ -150,6 +172,10 @@ impl ToolbarModel {
     /// no toolbar buttons for redo, pinning or options (those are hotkeys and
     /// tray-menu entries), so none are invented here.
     pub fn visible_buttons(settings: &Settings) -> Vec<ButtonId> {
+        Self::collect_buttons(settings, pen_width_visible(settings))
+    }
+
+    fn collect_buttons(settings: &Settings, pen_width: bool) -> Vec<ButtonId> {
         let mut buttons = Vec::with_capacity(MAX_PEN_BUTTONS + 10);
         buttons.push(ButtonId::Dock);
         for (index, pen) in settings.pens.iter().enumerate() {
@@ -166,7 +192,7 @@ impl ToolbarModel {
         if settings.pointer_icon {
             buttons.push(ButtonId::Pointer);
         }
-        if settings.pen_width_icon {
+        if pen_width {
             buttons.push(ButtonId::PenWidth);
         }
         if settings.ink_visible_icon {
@@ -189,6 +215,20 @@ impl ToolbarModel {
     /// pen 1 when enabled, otherwise the first enabled pen, otherwise the
     /// pointer tool; ink starts visible.
     pub fn from_settings(settings: &Settings) -> Self {
+        Self::from_settings_with_buttons(settings, Self::visible_buttons(settings))
+    }
+
+    /// Reproduces the legacy toolbar exactly (honouring `Pen_Width_Icon`),
+    /// without the MVP policy. Used by legacy-parity capture tooling; the
+    /// application must use [`Self::from_settings`].
+    pub fn from_settings_legacy(settings: &Settings) -> Self {
+        Self::from_settings_with_buttons(
+            settings,
+            Self::collect_buttons(settings, settings.pen_width_icon),
+        )
+    }
+
+    fn from_settings_with_buttons(settings: &Settings, buttons: Vec<ButtonId>) -> Self {
         let mut pens = [PenSwatch {
             color: crate::settings::Rgb::new(0, 0, 0),
             alpha: 255,
@@ -210,7 +250,7 @@ impl ToolbarModel {
                 .or(Some(ButtonId::Pointer))
         };
         Self {
-            buttons: Self::visible_buttons(settings),
+            buttons,
             pens,
             active,
             ink_visible: true,

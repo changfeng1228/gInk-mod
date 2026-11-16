@@ -52,6 +52,7 @@ fn layout_matches_legacy_enabled_button_order() {
             Eraser,
             Pan,
             Pointer,
+            PenWidth,
             InkVisible,
             Snapshot,
             Undo,
@@ -65,8 +66,19 @@ fn layout_matches_legacy_enabled_button_order() {
         "Pen0 is disabled by default (legacy Pen0_Enabled=False)"
     );
     assert!(
-        !buttons.contains(&PenWidth),
-        "the pen-width button is hidden by default (legacy Pen_Width_Icon=False)"
+        !settings.pen_width_icon,
+        "the code default still parses Pen_Width_Icon=False"
+    );
+    assert!(
+        buttons.contains(&PenWidth),
+        "the MVP always exposes the pen-width button even when Pen_Width_Icon=False \
+         (the options UI that could re-enable it does not exist yet)"
+    );
+    assert!(
+        !ToolbarModel::from_settings_legacy(&settings)
+            .buttons()
+            .contains(&PenWidth),
+        "the legacy-parity model must still honour Pen_Width_Icon=False"
     );
 
     let model = default_model();
@@ -101,9 +113,12 @@ fn layout_matches_legacy_enabled_button_order() {
     assert!(close(pan.left, eraser.left + 1.1 * bs));
     assert!(close(pointer.left, pan.left + 1.1 * bs));
 
-    // Gap after the pointer group; the hidden pen-width button changes nothing.
+    // Gap after the pointer group, then the MVP-visible pen-width button and
+    // the remaining action buttons.
+    let pen_width = rect_of(&layout, PenWidth);
+    assert!(close(pen_width.left, pointer.left + 1.1 * bs + 0.8 * bs));
     let ink_visible = rect_of(&layout, InkVisible);
-    assert!(close(ink_visible.left, pointer.left + 1.1 * bs + 0.8 * bs));
+    assert!(close(ink_visible.left, pen_width.left + 1.1 * bs));
     let snapshot = rect_of(&layout, Snapshot);
     let undo = rect_of(&layout, Undo);
     let clear = rect_of(&layout, Clear);
@@ -130,13 +145,13 @@ fn layout_matches_legacy_enabled_button_order() {
         "below the panel"
     );
 
-    // Visibility rules: enable Pen0/Pen9 and the pen-width button, hide the
-    // eraser/pan/pointer/undo buttons. The gaps stay where the legacy code
-    // inserts them.
+    // Visibility rules: enable Pen0/Pen9, keep Pen_Width_Icon=False (the MVP
+    // must ignore it) and hide the eraser/pan/pointer/undo buttons. The gaps
+    // stay where the legacy code inserts them.
     let mut custom = Settings::defaults();
     custom.pens[0].enabled = true;
     custom.pens[9].enabled = true;
-    custom.pen_width_icon = true;
+    custom.pen_width_icon = false;
     custom.eraser_icon = false;
     custom.pan_icon = false;
     custom.pointer_icon = false;
@@ -250,14 +265,19 @@ fn hit_test_tracks_dpi_and_docking() {
         "nothing besides the dock button exists in the docked strip"
     );
 
-    let probe = DipPoint::new(995.0, 30.0);
+    // Probe the exit button near its right edge: the point must hit Exit on
+    // the panel and fall inside the dock strip (flush with the panel's right
+    // edge) once docked. It is derived from the layout because the MVP-visible
+    // pen-width button widens the panel and moves Exit to the right.
+    let exit_rect = rect_of(&layout, ButtonId::Exit);
+    let probe = DipPoint::new(exit_rect.right - 0.2 * 0.88 * HEIGHT_DIP, 30.0);
     let probe_physical = map.dip_to_physical(probe);
     let probe_screen =
         PhysicalPoint::new(panel.left + probe_physical.x, panel.top + probe_physical.y);
     assert_eq!(
         layout.hit_test(probe),
         Some(ButtonId::Exit),
-        "995 DIP is inside the exit button at this panel width"
+        "the probe must hit the exit button at this panel width"
     );
     assert_eq!(
         docked.hit_test_physical(probe_screen, strip, map),

@@ -61,7 +61,7 @@ use crate::settings_store::StorageRoots;
 use crate::telemetry::{LogError, LogSink};
 use crate::tray::{MENU_EXIT, TrayError, TrayIcon};
 use crate::ui::pen_width::{DEFAULT_WIDTH_HIMETRIC, PenWidthPanel};
-use crate::ui::toolbar::{ButtonId, ToolbarWindow as ToolbarUiWindow};
+use crate::ui::toolbar::{ButtonId, ToolbarWindow as ToolbarUiWindow, pen_width_visible};
 
 /// Singleton mutex of the new app. Deliberately different from the legacy
 /// gInk GUID, so the legacy instance and a development build can coexist.
@@ -123,9 +123,10 @@ impl AppMode {
 
 /// Development options. `--no-hotkeys` keeps a test run from claiming the
 /// legacy app's combinations; `--draw` enters drawing mode without the tray or
-/// hotkey; `--pen-width` forces the legacy pen-width button visible for an
-/// acceptance run without editing any config; `--exit-after-ms` lets the
-/// desktop smoke test start and stop the real shell without synthetic input.
+/// hotkey; `--pen-width` is retained for compatibility and is now a no-op,
+/// because the MVP always shows the pen-width button; `--exit-after-ms` lets
+/// the desktop smoke test start and stop the real shell without synthetic
+/// input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
     pub no_hotkeys: bool,
@@ -357,7 +358,8 @@ impl App {
         // while Windows owns that pointer.
         let mut settings = settings;
         if options.pen_width {
-            // Development-only visibility override; never writes a config key.
+            // Retained for compatibility with existing test invocations; the
+            // MVP policy in `ui::toolbar` already exposes the button.
             settings.pen_width_icon = true;
         }
         let mut shell = Box::new(Shell::new(settings, options, log));
@@ -1712,7 +1714,11 @@ impl Shell {
     fn refresh_pen_style(&mut self) {
         let index = self.pen_index;
         let global_width = self.global_pen_width;
-        let override_width = self.settings.pen_width_icon;
+        // The MVP always exposes the width slider, so its session-global width
+        // must apply even when the imported legacy config says
+        // `Pen_Width_Icon = False`; otherwise dragging the visible slider
+        // would not change the pen.
+        let override_width = pen_width_visible(&self.settings);
         if let Some(session) = self.ink.as_mut() {
             let dpi = display_dpi(session);
             let mut style = pen_style_for_dpi(&self.settings.pens[index], dpi);

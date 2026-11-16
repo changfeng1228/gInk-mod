@@ -239,7 +239,7 @@ $shell = [IntPtr]::Zero
 $verified = $false
 try {
     $process = Start-Process -FilePath $exe -WorkingDirectory $Package -PassThru -ArgumentList @(
-        '--no-hotkeys', '--draw', '--pen-width', '--exit-after-ms', '120000'
+        '--no-hotkeys', '--draw', '--exit-after-ms', '120000'
     )
     $overlay = Wait-PlnkWindow 'plnk_gate_window' 'plnk overlay'
     $toolbar = Wait-PlnkWindow 'plnk_gate_window' 'plnk toolbar'
@@ -279,7 +279,9 @@ try {
     $toolbarRect = Get-PlnkRect $toolbar
     $height = $toolbarRect.Bottom - $toolbarRect.Top
     $button = 0.88 * $height
-    # Defaults + --pen-width: five pens, eraser/pan/pointer, then pen width.
+    # No --pen-width: defaults (Pen_Width_Icon=False) must still show the
+    # MVP pen-width button. Defaults: five pens, eraser/pan/pointer, then the
+    # pen-width button; its centre is 12.1 button widths from the panel edge.
     $penWidthX = $toolbarRect.Left + [int](12.1 * $button)
     $penWidthY = $toolbarRect.Top + [int](0.51 * $height)
     Invoke-PlnkClick $penWidthX $penWidthY
