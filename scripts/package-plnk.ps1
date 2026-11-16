@@ -1,10 +1,13 @@
 ﻿# Builds the plnk portable package under <repo>\release by default.
 # The Desktop only ever holds a shortcut to the newest package; release
 # artifacts (folder + zip) must stay in the git-ignored release\ directory.
+# The Startup autostart shortcut (and an existing desktop release shortcut)
+# is updated automatically after packaging; use -SkipShortcuts for CI or dry runs.
 [CmdletBinding()]
 param(
     [string]$Version = '',
-    [string]$Destination = ''
+    [string]$Destination = '',
+    [switch]$SkipShortcuts
 )
 
 Set-StrictMode -Version Latest
@@ -177,6 +180,13 @@ $assetCount = (Get-ChildItem -LiteralPath (Join-Path $package 'assets\icons') -F
 if ($assetCount -ne 34) {
     throw "Unexpected packaged asset count: $assetCount (expected 34)"
 }
+
+# Keep the Startup (autostart) shortcut on the newest package automatically;
+# -SkipShortcuts is for CI or dry runs where no user profile is available.
+if (-not $SkipShortcuts) {
+    & (Join-Path $PSScriptRoot 'update-plnk-shortcuts.ps1') -PackagePath $package
+}
+
 [pscustomobject]@{
     Package = $package
     Zip = $zip
