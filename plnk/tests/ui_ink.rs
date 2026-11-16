@@ -539,12 +539,12 @@ fn mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits() {
 /// Regression for the reported "ink only appears after mouse release" bug.
 ///
 /// The active layer is cleared inside each new point's dirty rect and then
-/// repainted incrementally. The dirty rect spans the previous quadratic, so a
-/// repaint that starts only at the newest midpoint erases a piece of the
-/// already drawn line and never restores it: while the button is held the
-/// stroke shows up as dashes, and only the release path (which redraws the
-/// whole stroke into the static cache) makes it continuous. This test reads
-/// the screen with the button still held and requires an unbroken line.
+/// repainted. Two successive defects were fixed here: an incremental repaint
+/// that started one quadratic too late (0.1.2) and, before that, dashes while
+/// dragging. The active layer now repaints the whole stroke with the commit
+/// renderer, so while the button is held the stroke must be unbroken and the
+/// same as the committed stroke. This test reads the screen with the button
+/// still held and requires an unbroken line.
 #[test]
 #[ignore = "creates a real DirectComposition overlay and injects real mouse input"]
 fn live_stroke_is_continuous_mid_drag_and_commits_on_release() {
@@ -636,6 +636,233 @@ fn live_stroke_is_continuous_mid_drag_and_commits_on_release() {
     drop(session);
     move_cursor(original_cursor);
     pump_for(Duration::from_millis(100));
+}
+
+/// The live stroke must be pixel-equivalent to the stroke that appears after
+/// mouse-up. The reported "虚化" (faint/dashed) live stroke came from the
+/// active layer clearing a dirty rect and repainting only an incremental
+/// tail: on curves and zigzags the cleared rect contains older parts of the
+/// stroke that the tail does not restore. The active path now repaints the
+/// whole stroke with the same `StrokeRenderer::draw(stroke)` call the commit
+/// uses, clipped to the dirty rect. This test draws slow lines, fast curves,
+/// zigzags, circles, short dots and translucent highlighters with real
+/// injected input and compares the screen pixels taken while the button is
+/// still held against the pixels after the stroke commits.
+#[test]
+#[ignore = "creates a real overlay and reads back screen pixels during a drag"]
+fn live_stroke_pixels_match_committed_render_for_all_stroke_shapes() {
+    let device = GraphicsDevice::new().expect("create graphics device");
+    let bounds = PhysicalRect::from_xywh(280, 280, 1040, 560);
+    let original_cursor = cursor_position();
+
+    let mut backdrop = BackdropWindow::new(&device, bounds).expect("backdrop window");
+    backdrop
+        .fill(Rgba8::new(255, 255, 255, 255))
+        .expect("backdrop fill");
+    backdrop.show();
+    pump_for(Duration::from_millis(150));
+
+    let mut session = InkSession::new(&device, bounds).expect("ink session");
+    session.set_pen_style(PenStyle::fixed(Rgba8::new(225, 60, 60, 255), 8.0));
+    session.surface_mut().expect("ink surface").show();
+    pump_for(Duration::from_millis(250));
+    assert_eq!(session.pen_cursor_count(), 4);
+
+    let line: Vec<PhysicalPoint> = (0..=60)
+        .map(|i| PhysicalPoint::new(420 + i * 4, 500))
+        .collect();
+    let curve: Vec<PhysicalPoint> = (0..=80)
+        .map(|i| {
+            let t = i as f32 / 80.0;
+            PhysicalPoint::new(
+                420 + i * 5,
+                520 + ((t * std::f32::consts::TAU * 1.5).sin() * 70.0) as i32,
+            )
+        })
+        .collect();
+    let zigzag: Vec<PhysicalPoint> = (0..=40)
+        .map(|i| PhysicalPoint::new(420 + i * 10, 520 + if i % 4 < 2 { -60 } else { 60 }))
+        .collect();
+    let circle: Vec<PhysicalPoint> = (0..=80)
+        .map(|i| {
+            let angle = i as f32 / 80.0 * std::f32::consts::TAU;
+            PhysicalPoint::new(
+                720 + (130.0 * angle.cos()) as i32,
+                520 + (130.0 * angle.sin()) as i32,
+            )
+        })
+        .collect();
+
+    let cases: [(&str, &[PhysicalPoint], PhysicalRect); 4] = [
+        (
+            "slow-line",
+            &line,
+            PhysicalRect::from_xywh(380, 460, 320, 90),
+        ),
+        (
+            "fast-curve",
+            &curve,
+            PhysicalRect::from_xywh(380, 420, 470, 220),
+        ),
+        (
+            "zigzag",
+            &zigzag,
+            PhysicalRect::from_xywh(380, 420, 480, 230),
+        ),
+        (
+            "circle",
+            &circle,
+            PhysicalRect::from_xywh(560, 360, 340, 340),
+        ),
+    ];
+    for (name, path, capture) in cases {
+        assert_live_pixels_match_commit(&mut session, name, path, capture);
+        session.clear().expect("clear the canvas");
+        pump_for(Duration::from_millis(120));
+    }
+
+    // Short dot: a tap is committed on release; the live dot must already be
+    // the committed dot.
+    let dot_capture = PhysicalRect::from_xywh(880, 440, 160, 140);
+    let screen = ScreenRegion::new(dot_capture);
+    move_cursor(PhysicalPoint::new(940, 510));
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    pump_for(Duration::from_millis(250));
+    screen.refresh();
+    let mid = screen.pixels_raw();
+    let mid_coverage = screen.column_coverage(dot_capture);
+    mouse_button(false);
+    pump_for(Duration::from_millis(300));
+    screen.refresh();
+    assert_live_pixels_match(
+        "short-dot",
+        &mid,
+        &screen.pixels_raw(),
+        mid_coverage,
+        screen.column_coverage(dot_capture),
+    );
+    assert_eq!(session.take_committed(), Some(1));
+    assert_eq!(session.take_error(), None);
+    session.clear().expect("clear the dot");
+    pump_for(Duration::from_millis(120));
+
+    // Translucent highlighter: first a horizontal stroke, then a vertical one
+    // crossing the committed stroke. The live translucent pixels must match
+    // the committed pixels both on white and over the already committed
+    // highlighter (the active layer stores the real premultiplied alpha, it
+    // is no longer an opaque mask).
+    session.set_pen_style(PenStyle::new(Rgba8::new(235, 125, 15, 80), 60.0, false));
+    let horizontal: Vec<PhysicalPoint> = (0..=70)
+        .map(|i| PhysicalPoint::new(480 + i * 6, 620))
+        .collect();
+    let vertical: Vec<PhysicalPoint> = (0..=40)
+        .map(|i| PhysicalPoint::new(720, 500 + i * 6))
+        .collect();
+    assert_live_pixels_match_commit(
+        &mut session,
+        "highlighter",
+        &horizontal,
+        PhysicalRect::from_xywh(450, 560, 480, 130),
+    );
+    assert_live_pixels_match_commit(
+        &mut session,
+        "highlighter-overlap",
+        &vertical,
+        PhysicalRect::from_xywh(620, 470, 220, 250),
+    );
+    assert_eq!(session.take_error(), None);
+
+    session.close_annotation().expect("clear the annotation");
+    session.surface_mut().expect("ink surface").hide();
+    drop(session);
+    move_cursor(original_cursor);
+    pump_for(Duration::from_millis(100));
+}
+
+/// Draws `path` with real injected input, captures the screen while the button
+/// is held, releases, captures again, and requires the two frames to be
+/// pixel-equivalent within anti-aliasing noise.
+fn assert_live_pixels_match_commit(
+    session: &mut InkSession,
+    name: &str,
+    path: &[PhysicalPoint],
+    capture: PhysicalRect,
+) {
+    assert!(path.len() >= 2, "{name}: path needs at least two points");
+    move_cursor(path[0]);
+    pump_for(Duration::from_millis(50));
+    mouse_button(true);
+    pump_for(Duration::from_millis(40));
+    for point in &path[1..] {
+        move_cursor(*point);
+        pump_for(Duration::from_millis(8));
+    }
+    pump_for(Duration::from_millis(280));
+
+    let screen = ScreenRegion::new(capture);
+    screen.refresh();
+    let mid = screen.pixels_raw();
+    let mid_coverage = screen.column_coverage(capture);
+
+    mouse_button(false);
+    pump_for(Duration::from_millis(320));
+    screen.refresh();
+    let after = screen.pixels_raw();
+    let after_coverage = screen.column_coverage(capture);
+    assert_live_pixels_match(name, &mid, &after, mid_coverage, after_coverage);
+    assert_eq!(
+        session.take_error(),
+        None,
+        "{name}: the live drawing path must not swallow a rendering error"
+    );
+}
+
+/// Requires the live frame's pixels to match the committed frame within
+/// anti-aliasing noise: no missing/extra ink, no periodic gaps.
+fn assert_live_pixels_match(
+    name: &str,
+    mid: &[u8],
+    after: &[u8],
+    mid_coverage: f64,
+    after_coverage: f64,
+) {
+    let stats = compare_pixels(mid, after);
+    let ink_mid = stats.ink_first.max(1);
+    let over_threshold = stats.diff_over_60 as f64 / ink_mid as f64;
+    println!(
+        "[live-eq] {name}: ink_mid={} ink_after={} diff>60={} ({:.2}%) max={} coverage mid={mid_coverage:.3} after={after_coverage:.3}",
+        stats.ink_first,
+        stats.ink_second,
+        stats.diff_over_60,
+        over_threshold * 100.0,
+        stats.max_diff,
+    );
+    assert!(
+        stats.ink_first as f64 >= stats.ink_second as f64 * 0.99
+            && stats.ink_second as f64 >= stats.ink_first as f64 * 0.99,
+        "{name}: live/committed ink areas differ ({} vs {} non-white pixels)",
+        stats.ink_first,
+        stats.ink_second
+    );
+    assert!(
+        over_threshold <= 0.015,
+        "{name}: {:.2}% of live pixels differ from the committed render by more than 60 \
+         (max channel-sum diff {})",
+        over_threshold * 100.0,
+        stats.max_diff
+    );
+    assert!(
+        stats.max_diff <= 80,
+        "{name}: live pixels differ from the committed render by up to {} \
+         (missing or extra ink, not anti-aliasing)",
+        stats.max_diff
+    );
+    assert!(
+        (mid_coverage - after_coverage).abs() <= 0.01,
+        "{name}: mid-drag column coverage {mid_coverage:.3} must match the committed \
+         coverage {after_coverage:.3} (periodic gaps would lower it)",
+    );
 }
 
 /// Regression for the reported spinning-circle cursor: with a NULL class
@@ -1591,6 +1818,12 @@ impl ScreenRegion {
         covered as f64 / (right - left) as f64
     }
 
+    /// Raw BGRA pixels in the captured rectangle (top-down DIB).
+    fn pixels_raw(&self) -> Vec<u8> {
+        let len = self.bounds.width() as usize * self.bounds.height() as usize * 4;
+        unsafe { std::slice::from_raw_parts(self.pixels as *const u8, len) }.to_vec()
+    }
+
     /// Writes the captured pixels as a top-down 32-bit BMP for the side-by-side
     /// user-acceptance artifact (converted to PNG by the SDD script).
     fn save_bmp(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -1621,6 +1854,48 @@ impl ScreenRegion {
         file.write_all(pixels)?;
         file.flush()
     }
+}
+
+/// Pixel comparison between the live frame and the committed frame.
+struct PixelComparison {
+    ink_first: usize,
+    ink_second: usize,
+    diff_over_60: usize,
+    max_diff: u32,
+}
+
+/// Compares two same-sized BGRA captures. `diff` is the sum of absolute
+/// per-channel differences (0-765); anti-aliasing noise stays tiny while a
+/// missing stroke piece reaches several hundred.
+fn compare_pixels(first: &[u8], second: &[u8]) -> PixelComparison {
+    assert_eq!(first.len(), second.len(), "captures must have equal size");
+    let mut comparison = PixelComparison {
+        ink_first: 0,
+        ink_second: 0,
+        diff_over_60: 0,
+        max_diff: 0,
+    };
+    let (first_pixels, _) = first.as_chunks::<4>();
+    let (second_pixels, _) = second.as_chunks::<4>();
+    assert_eq!(first_pixels.len(), second_pixels.len());
+    for (a, b) in first_pixels.iter().zip(second_pixels) {
+        let ink_first = a[..3].iter().any(|channel| *channel < 245);
+        let ink_second = b[..3].iter().any(|channel| *channel < 245);
+        if ink_first {
+            comparison.ink_first += 1;
+        }
+        if ink_second {
+            comparison.ink_second += 1;
+        }
+        let diff: u32 = (0..3)
+            .map(|channel| u32::from(a[channel]).abs_diff(u32::from(b[channel])))
+            .sum();
+        if diff > 60 {
+            comparison.diff_over_60 += 1;
+        }
+        comparison.max_diff = comparison.max_diff.max(diff);
+    }
+    comparison
 }
 
 impl Drop for ScreenRegion {

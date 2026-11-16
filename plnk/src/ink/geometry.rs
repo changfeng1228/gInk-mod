@@ -136,47 +136,6 @@ pub fn smooth_samples(points: &[PenPoint], style: &PenStyle) -> Vec<StrokeSample
     out
 }
 
-/// Builds the geometry that has to be repainted on the active layer for the
-/// new raw points. `rendered_points` is the raw-point count already on screen.
-///
-/// The dirty rect of a new point covers the last three raw points
-/// ([`push_dirty_rect`]), so clearing it also erases the tail of the curve that
-/// was already rendered for the previous point count. The repaint therefore
-/// starts two controls back — one quadratic earlier than the new point — so
-/// every pixel the clear removed inside the region is drawn again. The tail
-/// still never re-tessellates the whole active stroke; a 1,000-point stroke
-/// repaints at most the last two quadratics per message.
-pub fn smooth_samples_increment(
-    points: &[PenPoint],
-    style: &PenStyle,
-    rendered_points: usize,
-) -> Vec<StrokeSample> {
-    if points.len() < 3 || rendered_points < 2 || rendered_points >= points.len() {
-        return smooth_samples(points, style);
-    }
-    // `rendered_points - 1` is the control of the first new quadratic; one
-    // control earlier is already on the layer but its dirty region is cleared,
-    // so it must be part of the repaint (see the module's smoothing notes).
-    let first_control = rendered_points.saturating_sub(2).max(1);
-    let last_control = points.len() - 2;
-    let mut out = Vec::new();
-    for index in first_control..=last_control {
-        emit_quadratic(
-            midpoint(&points[index - 1], &points[index], style),
-            sample(&points[index], style),
-            midpoint(&points[index], &points[index + 1], style),
-            &mut out,
-        );
-    }
-    let last = points.len() - 1;
-    emit_line(
-        midpoint(&points[last - 1], &points[last], style),
-        sample(&points[last], style),
-        &mut out,
-    );
-    out
-}
-
 fn emit_line(start: StrokeSample, end: StrokeSample, out: &mut Vec<StrokeSample>) {
     push_if_changed(out, start);
     push_if_changed(out, end);

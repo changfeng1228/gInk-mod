@@ -16,7 +16,9 @@ use std::mem::size_of;
 use std::time::{Duration, Instant};
 
 use plnk::gfx::Rgba8;
-use plnk::ink::{Edit, InkDocument, PenPoint, PenStyle, PhysicalPointF, Stroke, StrokeSample};
+use plnk::ink::{
+    DirtyRect, Edit, InkDocument, PenPoint, PenStyle, PhysicalPointF, Stroke, StrokeSample,
+};
 
 /// Deterministic LCG so the stress test never depends on the platform RNG.
 struct Lcg(u64);
@@ -722,41 +724,44 @@ fn quadratic_width_interpolation_keeps_pressure_spikes() {
 }
 
 #[test]
-fn incremental_samples_repaint_the_cleared_tail_and_match_full_tail() {
-    let style = PenStyle::pressure(Rgba8::new(0, 0, 0, 255), 40.0);
-    let points: Vec<PenPoint> = (0..10)
-        .map(|index| {
-            PenPoint::new(
-                PhysicalPointF::new(index as f32 * 30.0, (index % 3) as f32 * 25.0),
-                (index % 4) as f32 / 3.0,
-                Duration::from_millis(index),
-            )
-        })
-        .collect();
-    let full = plnk::ink::geometry::smooth_samples(&points, &style);
-    let incremental = plnk::ink::geometry::smooth_samples_increment(&points, &style, 4);
-    assert_eq!(incremental.last(), full.last());
-    assert_eq!(
-        incremental.first().map(|sample| sample.position),
-        Some(PhysicalPointF::new(45.0, 37.5)),
-        "repainting must start one quadratic back: the dirty rect of a new \
-         point clears the previous quadratic's midpoint, so that midpoint \
-         must be redrawn"
-    );
-    // The incremental geometry is the same curve as the full stroke's tail:
-    // every repainted sample must match the full smoothing exactly (otherwise
-    // a live stroke would visibly splice two different curves together).
-    let start = full
-        .iter()
-        .position(|sample| Some(*sample) == incremental.first().copied())
-        .expect("the incremental start exists in the full curve");
-    assert_eq!(
-        &full[start..start + incremental.len()],
-        incremental.as_slice(),
-        "the repainted tail must match the full smoothed curve"
-    );
-    assert!(incremental.len() < full.len());
-    for sample in incremental {
-        assert_finite_sample(&sample);
+fn dirty_rect_covers_the_changed_smoothing_window() {
+    // A new raw point changes the previous quadratic (start midpoint through
+    // the previous control to the new midpoint) and the new straight cap. The
+    // dirty rect must cover that whole window plus half the maximum stroke
+    // width and an anti-aliasing pixel, so that clearing it can never remove
+    // ink outside the area the full-stroke repaint restores.
+    let style = PenStyle::fixed(Rgba8::new(0, 0, 0, 255), 40.0);
+    let mut stroke = Stroke::new(style);
+    let points = [
+        (100.0, 100.0),
+        (140.0, 130.0),
+        (150.0, 190.0),
+        (200.0, 200.0),
+    ];
+    let mut dirty = DirtyRect::EMPTY;
+    for (index, (x, y)) in points.iter().enumerate() {
+        dirty = stroke.push(point_at(*x, *y, index as u64));
     }
+    let margin = style.max_width() * 0.5 + 1.0;
+    for (x, y) in &points[1..] {
+        assert!(
+            dirty.left as f32 <= *x - margin
+                && dirty.right as f32 >= *x + margin
+                && dirty.top as f32 <= *y - margin
+                && dirty.bottom as f32 >= *y + margin,
+            "dirty rect {dirty:?} must cover the last three raw points plus the width/AA margin"
+        );
+    }
+    // The previous midpoint (where the changed quadratic starts) is covered.
+    let midpoint = (
+        (points[1].0 + points[2].0) * 0.5,
+        (points[1].1 + points[2].1) * 0.5,
+    );
+    assert!(
+        dirty.left as f32 <= midpoint.0 - margin
+            && dirty.right as f32 >= midpoint.0 + margin
+            && dirty.top as f32 <= midpoint.1 - margin
+            && dirty.bottom as f32 >= midpoint.1 + margin,
+        "dirty rect {dirty:?} must cover the changed quadratic's start midpoint {midpoint:?}"
+    );
 }

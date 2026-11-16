@@ -73,12 +73,10 @@ pub struct InkSurface {
     window: OverlayWindow,
     origin: PhysicalPointF,
     size: (u32, u32),
-    /// Color applied once at composition time. The active bitmap is an opacity
-    /// mask, so overlapping incremental pieces cannot darken a highlighter.
+    /// Style colour of the live stroke. The active target stores the stroke
+    /// with its real premultiplied colour/alpha (exactly like the static
+    /// commit path); this value only tracks whether a live stroke exists.
     active_color: crate::gfx::Rgba8,
-    /// Raw points already rendered into `active_target`; only the new tail is
-    /// smoothed and tessellated on the next pointer message.
-    active_rendered_points: usize,
     painted_area: u64,
     last_present: PresentStats,
 }
@@ -125,7 +123,6 @@ impl InkSurface {
             origin: PhysicalPointF::new(bounds.left as f32, bounds.top as f32),
             size,
             active_color: crate::gfx::Rgba8::new(0, 0, 0, 0),
-            active_rendered_points: 0,
             painted_area: 0,
             last_present: PresentStats::default(),
         })
@@ -234,22 +231,24 @@ impl InkSurface {
         )
     }
 
-    /// Redraws only the new active-stroke tail inside `region` on the active
-    /// layer (the region is cleared first). The layer is an opaque RGB cache; its
-    /// actual color/alpha is applied once in `present`, so incremental pieces
-    /// cannot create translucent overlap seams.
+    /// Repaints the whole live stroke inside `region` on the active layer (the
+    /// region is cleared first).
+    ///
+    /// This deliberately uses the exact same `StrokeRenderer::draw(stroke)`
+    /// path as the committal into the static cache. The active pixels are
+    /// therefore pixel-equivalent to the pixels the stroke will have after
+    /// `mouse-up`: same smoothing, same width, same colour/alpha, same caps,
+    /// no incremental tail seams. Clipping only limits rasterization to the
+    /// dirty rectangle (whose margin covers the full stroke half-width plus
+    /// anti-aliasing); it does not change any pixel inside that rectangle.
+    ///
+    /// Why not repaint just the new tail: the dirty rect spans the smoothing
+    /// window of the newest points, and on curves/zigzags it can contain older
+    /// parts of the same stroke. Clearing it and repainting only a tail erases
+    /// ink the tail does not cover, which is exactly the "虚化" (faint/dashed)
+    /// live stroke the user reported.
     pub fn draw_active(&mut self, stroke: &Stroke, region: &DirtyRegion) -> Result<(), GfxError> {
-        let previous = self.active_rendered_points;
-        let full_redraw =
-            previous == 0 || stroke.len() < previous || region.contains_rect(stroke.bounds());
-        let rendered = if full_redraw { 0 } else { previous };
-        let samples = crate::ink::geometry::smooth_samples_increment(
-            stroke.points(),
-            stroke.style(),
-            rendered,
-        );
         self.active_color = stroke.style().color;
-        let active_color = self.active_color;
         let Self {
             active_context,
             factory,
@@ -258,7 +257,7 @@ impl InkSurface {
             ..
         } = self;
         let origin = *origin;
-        let result = rasterize(
+        rasterize(
             active_context,
             factory,
             origin,
@@ -267,21 +266,14 @@ impl InkSurface {
             true,
             |context, factory, _clip| {
                 let mut renderer = StrokeRenderer::new(context, factory, origin);
-                let opaque = crate::gfx::Rgba8 {
-                    a: 255,
-                    ..active_color
-                };
-                renderer.draw_samples(&samples, opaque)
+                renderer.draw(stroke)
             },
-        );
-        self.active_rendered_points = if result.is_ok() { stroke.len() } else { 0 };
-        result
+        )
     }
 
     /// Clears the active layer inside `region` (cancel/leave/commit path).
     pub fn clear_active(&mut self, region: &DirtyRegion) -> Result<(), GfxError> {
         self.active_color = crate::gfx::Rgba8::new(0, 0, 0, 0);
-        self.active_rendered_points = 0;
         let Self {
             active_context,
             factory,
@@ -342,12 +334,14 @@ impl InkSurface {
                     None,
                 );
                 if active_color.a != 0 {
-                    // RGB is opaque in the active cache; alpha is applied once
-                    // here, so incremental overlap cannot darken highlighters.
+                    // The active target already stores the stroke with its real
+                    // premultiplied colour and alpha (the same render as the
+                    // commit path), so it is composited at full opacity — the
+                    // pixels are identical to the committed stroke's pixels.
                     context.DrawBitmap(
                         active_target,
                         Some(&destination as *const D2D_RECT_F),
-                        f32::from(active_color.a) / 255.0,
+                        1.0,
                         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                         None,
                         None,
