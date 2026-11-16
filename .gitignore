@@ -36,3 +36,7 @@ bin/*.ini
 !bin/config_default.ini
 bin/crash.txt
 bin/gInk_debug.log
+
+# --- tianshu (agent runtime) working files ---
+.rivet/
+.rivet.md
