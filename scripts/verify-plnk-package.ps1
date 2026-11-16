@@ -1,6 +1,12 @@
-﻿[CmdletBinding()]
+﻿# Verifies a packaged plnk build. By default it verifies the package matching
+# the current plnk/Cargo.toml version under <repo>\release. Use -Package to
+# point at an explicit package folder, or -Version/-Destination to resolve
+# <Destination>\plnk-v<Version>-win64 (Destination defaults to <repo>\release).
+[CmdletBinding()]
 param(
     [string]$Package = '',
+    [string]$Version = '',
+    [string]$Destination = '',
     [string]$EvidenceDirectory = (Join-Path $env:TEMP 'plnk-package-evidence')
 )
 
@@ -9,15 +15,24 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
 $repo = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($Destination)) {
+    $Destination = Join-Path $repo 'release'
+}
 if ([string]::IsNullOrWhiteSpace($Package)) {
-    $manifest = Join-Path $repo 'plnk\Cargo.toml'
-    $manifestText = [IO.File]::ReadAllText($manifest)
-    $packageSection = [regex]::Match($manifestText, '(?ms)^\[package\]\s*$.*?(?=^\[|\z)')
-    $manifestVersion = [regex]::Match($packageSection.Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
-    if (-not $packageSection.Success -or -not $manifestVersion.Success) {
-        throw "Could not read the [package] version from $manifest"
+    if ([string]::IsNullOrWhiteSpace($Version)) {
+        $manifest = Join-Path $repo 'plnk\Cargo.toml'
+        $manifestText = [IO.File]::ReadAllText($manifest)
+        $packageSection = [regex]::Match($manifestText, '(?ms)^\[package\]\s*$.*?(?=^\[|\z)')
+        $manifestVersion = [regex]::Match($packageSection.Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
+        if (-not $packageSection.Success -or -not $manifestVersion.Success) {
+            throw "Could not read the [package] version from $manifest"
+        }
+        $Version = $manifestVersion.Groups[1].Value
     }
-    $Package = Join-Path ([Environment]::GetFolderPath('Desktop')) "plnk-v$($manifestVersion.Groups[1].Value)-win64"
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+        throw "Invalid version '$Version'; expected x.y.z (for example 0.1.1)."
+    }
+    $Package = Join-Path $Destination "plnk-v$Version-win64"
 }
 $Package = (Resolve-Path -LiteralPath $Package).Path
 

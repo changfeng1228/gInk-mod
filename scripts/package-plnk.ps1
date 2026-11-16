@@ -1,7 +1,10 @@
-﻿[CmdletBinding()]
+﻿# Builds the plnk portable package under <repo>\release by default.
+# The Desktop only ever holds a shortcut to the newest package; release
+# artifacts (folder + zip) must stay in the git-ignored release\ directory.
+[CmdletBinding()]
 param(
     [string]$Version = '',
-    [string]$Destination = [Environment]::GetFolderPath('Desktop')
+    [string]$Destination = ''
 )
 
 Set-StrictMode -Version Latest
@@ -24,6 +27,9 @@ function Get-PlnkManifestVersion([string]$ManifestPath) {
 }
 
 $repo = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($Destination)) {
+    $Destination = Join-Path $repo 'release'
+}
 $manifest = Join-Path $repo 'plnk\Cargo.toml'
 if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
     throw "Cargo manifest is missing: $manifest"
@@ -62,9 +68,15 @@ if ($versionInfo.FileVersion -ne $expectedFileVersion -or
     throw "Release VERSIONINFO does not match $expectedFileVersion / plnk.exe; rebuild before packaging."
 }
 
-if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
-    throw "Desktop destination does not exist: $Destination"
+if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+    throw "Destination is a file, not a directory: $Destination"
 }
+if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+}
+# Safety: only the versioned package folder and zip created by this script are
+# ever removed (and only after they are recognised as plnk packages below).
+# Unrelated files in the destination directory are never touched.
 $name = "plnk-v$Version-win64"
 $package = Join-Path $Destination $name
 $zip = "$package.zip"
