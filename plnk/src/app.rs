@@ -29,17 +29,18 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey, VK_ESCAPE,
+    GetKeyState, HOT_KEY_MODIFIERS, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+    VK_ESCAPE,
 };
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetMessageW, GetWindowLongPtrW, HCURSOR, HTCLIENT, MB_ICONERROR, MB_OK, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW,
-    TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY,
-    WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GetMessageW, GetWindowLongPtrW, HCURSOR, HTCLIENT, KillTimer, MB_ICONERROR, MB_OK, MSG,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, WM_APP, WM_CAPTURECHANGED, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{Error as WindowsError, HRESULT, HSTRING, PCWSTR, w};
 
@@ -49,13 +50,14 @@ use crate::gfx::device::{GfxError, GraphicsDevice};
 use crate::gfx::ink_surface::InkSurface;
 use crate::hotkeys::{Command, GlobalHotkeys, HotkeyIssue, HotkeyMap};
 use crate::ink::controller::InkController;
-use crate::ink::dirty::DirtyRegion;
+use crate::ink::dirty::{DirtyRect, DirtyRegion};
 use crate::ink::geometry::PhysicalPointF;
-use crate::ink::model::{Edit, PenStyle};
+use crate::ink::model::{Edit, InkDocument, PenStyle};
 use crate::input::{MouseNormalizer, PointerKind, PointerNormalizer};
 use crate::platform::cursor::{CanvasCursors, default_class_cursor};
 use crate::platform::dpi::PhysicalRect;
 use crate::platform::window::{MonotonicClock, current_monitor_rect, ensure_process_dpi_awareness};
+use crate::settings::{Hotkey, HotkeyKey};
 use crate::settings::{PenSettings, Settings};
 use crate::settings_store::{SettingsStore, StorageRoots};
 use crate::telemetry::{LogError, LogSink};
@@ -86,6 +88,17 @@ pub const PEN_WIDTH_CHANGE_MESSAGE: u32 = WM_APP + 23;
 const ANNOTATION_ESCAPE_HOTKEY_ID: i32 = 0x4553; // "ES"
 
 const EXIT_TIMER_ID: usize = 0x504C; // "PL"
+/// Erase radius in physical pixels. Generous enough that a mouse can hit a
+/// stroke without pixel-perfect aim; the legacy eraser used a similar reach.
+const ERASER_RADIUS: f32 = 12.0;
+/// Polling timer for the tool hotkeys while an annotation session is running.
+///
+/// `RegisterHotKey` cannot be used for these: the legacy defaults are bare keys
+/// (`E`, `V`, the digits), and a system-wide registration would steal those
+/// letters from every other application. The legacy program polled
+/// `GetKeyState` only while annotating, and so does this one.
+const TOOL_HOTKEY_TIMER_ID: usize = 0x5448; // "TH"
+const TOOL_HOTKEY_POLL_MS: u32 = 30;
 const IO_QUEUE_CAPACITY: usize = 8;
 
 /// The single application state. Later tasks add real drawing/pointer/snapping
@@ -689,6 +702,12 @@ pub struct InkSession {
     mouse_down: bool,
     committed: Option<usize>,
     last_error: Option<String>,
+    /// Whether the ink is currently shown. Hiding is a view state: the document
+    /// keeps every stroke, and undo cannot consume it (legacy `InkVisible`).
+    ink_visible: bool,
+    /// True when the next contact erases whole strokes instead of drawing
+    /// (legacy `SelectPen(-1)` -> `EnterEraserMode(true)`).
+    eraser: bool,
 }
 
 impl InkSession {
@@ -715,6 +734,8 @@ impl InkSession {
             mouse_down: false,
             committed: None,
             last_error: None,
+            ink_visible: true,
+            eraser: false,
         });
         let data = &mut *session as *mut Self as *mut core::ffi::c_void;
         let surface = InkSurface::new_with_hook(device, bounds, session_hook, data)?;
@@ -769,6 +790,82 @@ impl InkSession {
     }
 
     /// Undoes the last edit and repaints only its pixels.
+    /// Redo the last undone edit and repaint only its pixels.
+    pub fn redo(&mut self) -> Result<(), GfxError> {
+        self.drop_active()?;
+        let Some(region) = self.controller.document_mut().redo() else {
+            return Ok(());
+        };
+        self.redraw_and_present(&region)
+    }
+
+    /// Whole-stroke erase at a physical position (legacy `StrokeErase`).
+    ///
+    /// Erasing empty space returns without touching the surface or the history,
+    /// so a stray click never consumes an undo slot.
+    pub fn erase_at(&mut self, position: PhysicalPointF, radius: f32) -> Result<(), GfxError> {
+        self.drop_active()?;
+        let region = self.controller.document_mut().erase_at(position, radius);
+        if region.is_empty() {
+            return Ok(());
+        }
+        self.redraw_and_present(&region)
+    }
+
+    /// Selects eraser mode for the next contact.
+    pub fn set_eraser(&mut self, eraser: bool) {
+        self.eraser = eraser;
+    }
+
+    /// Whether the next contact will erase instead of draw.
+    pub fn is_eraser(&self) -> bool {
+        self.eraser
+    }
+
+    /// Whether the ink is currently shown.
+    pub fn ink_visible(&self) -> bool {
+        self.ink_visible
+    }
+
+    /// Shows or hides the ink without touching the document.
+    ///
+    /// Returns the region to repaint (the whole canvas either way, because
+    /// hiding must clear every visible stroke and showing must draw them back).
+    pub fn set_ink_visible(&mut self, visible: bool) -> Result<(), GfxError> {
+        if self.ink_visible == visible {
+            return Ok(());
+        }
+        self.ink_visible = visible;
+        self.redraw_all()
+    }
+
+    /// Repaints the whole canvas from the document, honouring `ink_visible`.
+    fn redraw_all(&mut self) -> Result<(), GfxError> {
+        let Self {
+            controller,
+            surface,
+            ink_visible,
+            ..
+        } = self;
+        let Some(surface) = surface.as_mut() else {
+            return Ok(());
+        };
+        let full = surface
+            .window_rect()
+            .map(|rect| {
+                DirtyRegion::from_rect(DirtyRect::new(rect.left, rect.top, rect.right, rect.bottom))
+            })
+            .unwrap_or_else(|_| DirtyRegion::new());
+        // Hiding redraws from an empty document: the static cache is rebuilt
+        // with no strokes, which clears the canvas without a separate API.
+        if *ink_visible {
+            surface.redraw_static(controller.document(), &full)?;
+        } else {
+            surface.redraw_static(&InkDocument::new(), &full)?;
+        }
+        surface.present(full).map(|_| ())
+    }
+
     pub fn undo(&mut self) -> Result<(), GfxError> {
         self.drop_active()?;
         let Some(region) = self.controller.document_mut().undo() else {
@@ -889,6 +986,14 @@ impl InkSession {
         let Some(position) = self.client_position(lparam) else {
             return false;
         };
+        if self.eraser {
+            // Eraser mode: whole-stroke erase at the contact point, and do not
+            // start a stroke. A failure is recorded, not swallowed.
+            if let Err(error) = self.erase_at(position, ERASER_RADIUS) {
+                self.record_error(error);
+            }
+            return false;
+        }
         self.apply_style(false);
         let point = self.mouse.sample(position, MonotonicClock::now());
         let dirty = self.controller.begin(point);
@@ -1103,6 +1208,37 @@ fn pointer_info(wparam: WPARAM) -> Option<(u32, POINTER_INFO)> {
         .map(|()| (pointer_id, info))
 }
 
+/// Whether `key` is currently held. `None` means "no key configured", which is
+/// never down.
+fn key_is_down(key: HotkeyKey) -> bool {
+    let virtual_key = match key {
+        HotkeyKey::Letter(letter) => u32::from(letter.to_ascii_uppercase()),
+        HotkeyKey::Digit(digit) if digit <= 9 => u32::from(b'0') + u32::from(digit),
+        HotkeyKey::NumPad(digit) if digit <= 9 => 0x60 + u32::from(digit),
+        HotkeyKey::Function(number) if (1..=24).contains(&number) => 0x70 + u32::from(number) - 1,
+        _ => return false,
+    };
+    (unsafe { GetKeyState(virtual_key as i32) } & 0x8000u16 as i16) != 0
+}
+
+/// Whether every modifier the configured hotkey requires is held.
+///
+/// Exact match, like the legacy `ModifierMatch`: a hotkey configured without
+/// Ctrl must not fire while Ctrl is down, or `E` would also trigger on Ctrl+E.
+fn modifiers_held(hotkey: &Hotkey) -> bool {
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const VK_SHIFT: i32 = 0x10;
+    const VK_LWIN: i32 = 0x5B;
+    const VK_RWIN: i32 = 0x5C;
+    let held = |key: i32| (unsafe { GetKeyState(key) } & 0x8000u16 as i16) != 0;
+    let control = held(VK_CONTROL);
+    let alt = held(VK_MENU);
+    let shift = held(VK_SHIFT);
+    let win = held(VK_LWIN) | held(VK_RWIN);
+    hotkey.control == control && hotkey.alt == alt && hotkey.shift == shift && hotkey.win == win
+}
+
 /// Window-procedure hook of the ink overlay.
 ///
 /// # Safety
@@ -1282,6 +1418,8 @@ struct Shell {
     exit_requested: bool,
     menu_open: bool,
     shutdown_done: bool,
+    /// Keys held down at the previous poll, so a hotkey fires on the edge only.
+    tool_keys_down: Vec<bool>,
     _not_send: PhantomData<Rc<()>>,
 }
 
@@ -1308,6 +1446,7 @@ impl Shell {
             exit_requested: false,
             menu_open: false,
             shutdown_done: false,
+            tool_keys_down: Vec::new(),
             _not_send: PhantomData,
         }
     }
@@ -1411,6 +1550,14 @@ impl Shell {
     }
 
     fn handle_command(&mut self, command: Command) {
+        // Tool commands act on the document and do not change the mode, so they
+        // are dispatched before the mode machine. Before this existed the
+        // hotkey map was never consulted at all and every tool hotkey was dead.
+        if self.run_tool_command(command) {
+            self.log_ink_error();
+            return;
+        }
+
         let previous = self.mode;
         let next = previous.after_command(command);
         if next == previous {
@@ -1579,6 +1726,7 @@ impl Shell {
             self.exit_annotation("Escape registration failed");
             return Err(error);
         }
+        self.start_tool_hotkeys();
         Ok(())
     }
 
@@ -1624,6 +1772,65 @@ impl Shell {
         self.log.info("annotation Escape hotkey unregistered");
     }
 
+    /// Starts the tool-hotkey poll while annotating.
+    fn start_tool_hotkeys(&mut self) {
+        let Some(hwnd) = self.window.as_ref().map(|window| window.hwnd()) else {
+            return;
+        };
+        if unsafe { SetTimer(Some(hwnd), TOOL_HOTKEY_TIMER_ID, TOOL_HOTKEY_POLL_MS, None) } == 0 {
+            self.log.warn("could not start the tool hotkey poll");
+            return;
+        }
+        // Seed the edge detector with the keys already held, so a key that was
+        // down when annotation started does not fire on the first poll.
+        let rows = crate::options::rebindable_hotkeys(&self.settings);
+        self.tool_keys_down = rows
+            .iter()
+            .map(|row| row.hotkey.key.is_some_and(key_is_down) && modifiers_held(&row.hotkey))
+            .collect();
+        self.log.info("tool hotkey poll started");
+    }
+
+    /// Stops the poll when annotation ends.
+    fn stop_tool_hotkeys(&mut self) {
+        if let Some(hwnd) = self.window.as_ref().map(|window| window.hwnd()) {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TOOL_HOTKEY_TIMER_ID);
+            }
+        }
+        self.tool_keys_down.clear();
+    }
+
+    /// One poll: fire each tool hotkey on the rising edge only.
+    ///
+    /// Mirrors the legacy rule: only while annotating, and in pointer mode only
+    /// when the user allowed it. The keys are polled rather than registered
+    /// because the legacy defaults are bare keys (`E`, `V`, the digits) and a
+    /// system-wide registration would steal them from every other application.
+    fn poll_tool_hotkeys(&mut self) {
+        if self.mode == AppMode::Tray {
+            return;
+        }
+        if self.mode == AppMode::Pointer && !self.settings.allow_hotkey_in_pointer_mode {
+            return;
+        }
+        let rows = crate::options::rebindable_hotkeys(&self.settings);
+        if self.tool_keys_down.len() != rows.len() {
+            self.tool_keys_down = vec![false; rows.len()];
+        }
+        let mut fired: Option<Command> = None;
+        for (index, row) in rows.iter().enumerate() {
+            let down = row.hotkey.key.is_some_and(key_is_down) && modifiers_held(&row.hotkey);
+            if down && !self.tool_keys_down[index] && fired.is_none() {
+                fired = Some(row.command);
+            }
+            self.tool_keys_down[index] = down;
+        }
+        if let Some(command) = fired {
+            self.handle_command(command);
+        }
+    }
+
     fn on_escape(&mut self) {
         if self
             .pen_width
@@ -1643,6 +1850,7 @@ impl Shell {
     fn exit_annotation(&mut self, reason: &str) {
         self.log.info(&format!("leaving annotation: {reason}"));
         self.unregister_annotation_escape();
+        self.stop_tool_hotkeys();
         self.hide_pen_width_panel();
         if let Some(session) = self.ink.as_mut() {
             if let Err(error) = session.close_annotation() {
@@ -1798,6 +2006,124 @@ impl Shell {
         self.log_ink_error();
     }
 
+    fn ink_redo(&mut self) {
+        let result = self.ink.as_mut().map(|session| session.redo());
+        match result {
+            Some(Ok(())) => self.log.info("ink redone"),
+            Some(Err(error)) => self.log.warn(&format!("redo failed: {error}")),
+            None => {}
+        }
+        self.log_ink_error();
+    }
+
+    fn ink_toggle_visible(&mut self) {
+        let next = self.ink.as_ref().map(|session| !session.ink_visible());
+        let Some(next) = next else {
+            return;
+        };
+        let result = self
+            .ink
+            .as_mut()
+            .map(|session| session.set_ink_visible(next));
+        match result {
+            Some(Ok(())) => self.log.info(if next { "ink shown" } else { "ink hidden" }),
+            Some(Err(error)) => self
+                .log
+                .warn(&format!("could not change ink visibility: {error}")),
+            None => {}
+        }
+        if let Some(toolbar) = self.toolbar.as_mut() {
+            let mut model = toolbar.model().clone();
+            model.set_ink_visible(next);
+            let _ = toolbar.set_model(model);
+        }
+        self.log_ink_error();
+    }
+
+    /// Enters eraser mode: the next contact erases whole strokes instead of
+    /// drawing (legacy `SelectPen(-1)`).
+    fn select_eraser(&mut self) {
+        self.hide_pen_width_panel();
+        if let Some(toolbar) = self.toolbar.as_mut() {
+            let mut model = toolbar.model().clone();
+            model.set_active(Some(ButtonId::Eraser));
+            if let Err(error) = toolbar.set_model(model) {
+                self.log
+                    .warn(&format!("could not refresh the toolbar: {error}"));
+            }
+        }
+        if let Some(session) = self.ink.as_mut() {
+            session.set_eraser(true);
+        }
+        self.log.info("eraser selected");
+    }
+
+    /// Enters pan mode (legacy `SelectPen(-3)`).
+    fn select_pan(&mut self) {
+        self.hide_pen_width_panel();
+        if let Some(toolbar) = self.toolbar.as_mut() {
+            let mut model = toolbar.model().clone();
+            model.set_active(Some(ButtonId::Pan));
+            if let Err(error) = toolbar.set_model(model) {
+                self.log
+                    .warn(&format!("could not refresh the toolbar: {error}"));
+            }
+        }
+        if let Some(session) = self.ink.as_mut() {
+            session.set_eraser(false);
+        }
+        self.log.info("pan selected");
+    }
+
+    /// Runs a document-scoped command. Returns false when `command` is a mode
+    /// command, which the caller handles.
+    fn run_tool_command(&mut self, command: Command) -> bool {
+        match command {
+            Command::SelectPen(index) => {
+                self.select_pen(index);
+                self.restore_pen_mode();
+                true
+            }
+            Command::Eraser => {
+                self.select_eraser();
+                true
+            }
+            Command::Pan => {
+                self.select_pan();
+                true
+            }
+            Command::Undo => {
+                self.ink_undo();
+                true
+            }
+            Command::Redo => {
+                self.ink_redo();
+                true
+            }
+            Command::InkVisible => {
+                self.ink_toggle_visible();
+                true
+            }
+            Command::Clear => {
+                self.ink_clear();
+                true
+            }
+            // Mode and snapshot commands stay with the mode machine.
+            Command::ToggleInk | Command::Pointer | Command::Snapshot | Command::SnapPin => false,
+        }
+    }
+
+    /// Leaving eraser/pan mode: a tool hotkey or a pen click must return to
+    /// drawing, otherwise the next contact would still erase.
+    fn restore_pen_mode(&mut self) {
+        if let Some(session) = self.ink.as_mut() {
+            session.set_eraser(false);
+        }
+        if self.mode == AppMode::Pointer {
+            self.handle_command(Command::Pointer);
+        }
+    }
+
     /// Toolbar click delivered asynchronously by the toolbar window.
     fn on_toolbar_click(&mut self, code: usize) {
         let Some(button) = ButtonId::from_code(code as u32) else {
@@ -1813,11 +2139,14 @@ impl Shell {
             ButtonId::PenWidth => self.toggle_pen_width(),
             ButtonId::Exit => self.exit_annotation("toolbar exit button"),
             ButtonId::Pointer => self.handle_command(Command::Pointer),
+            ButtonId::InkVisible => self.ink_toggle_visible(),
+            // Eraser and pan change what the next contact does; the pan drag
+            // itself is driven by the overlay, so only the mode flips here.
+            ButtonId::Eraser => self.select_eraser(),
+            ButtonId::Pan => self.select_pan(),
+            ButtonId::Snapshot => self.log.info("snapshot is not implemented yet (Task 10)"),
             // The dock slide is handled inside the toolbar window itself.
             ButtonId::Dock => {}
-            other => self.log.info(&format!(
-                "toolbar button {other:?} is not wired in the drawing MVP (Task 8)"
-            )),
         }
         self.log_ink_error();
     }
@@ -2061,6 +2390,10 @@ unsafe extern "system" fn shell_window_proc(
             if wparam.0 == EXIT_TIMER_ID {
                 unsafe {
                     with_shell(hwnd, |shell| shell.request_exit("development exit timer"));
+                }
+            } else if wparam.0 == TOOL_HOTKEY_TIMER_ID {
+                unsafe {
+                    with_shell(hwnd, |shell| shell.poll_tool_hotkeys());
                 }
             }
             LRESULT(0)
