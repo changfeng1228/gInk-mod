@@ -35,7 +35,10 @@ $targets = @('ui_ink', 'ui_smoke', 'ui_toolbar')
 $results = @()
 
 foreach ($target in $targets) {
-    $tail = @('--', '--ignored', '--test-threads=1')
+    # --nocapture is required: without it Cargo swallows the test stdout and the
+    # PLNK_SKIP marker never reaches this script, which would then report every
+    # skipped test as Passed.
+    $tail = @('--', '--ignored', '--test-threads=1', '--nocapture')
     $arguments = @('test', '--manifest-path', $manifest, '--test', $target) + $tail
     $rendered = "cargo " + (($profileArgs + $arguments) -join ' ')
 
