@@ -21,6 +21,28 @@
 //! Run with:
 //! `cargo test --manifest-path plnk/Cargo.toml --test ui_toolbar -- --ignored --test-threads=1`
 
+#[path = "support/mod.rs"]
+mod support;
+
+/// Yields the desktop or returns early with a SKIP marker.
+///
+/// Expands to a `let` binding so the guard lives for the rest of the test body
+/// and its `Drop` restores the pointer. Kept as a macro so all desktop tests
+/// express the gate identically and a future change lands in one place.
+macro_rules! acquire_desktop {
+    () => {
+        let _desktop_guard = match $crate::support::gui::DesktopGuard::acquire(
+            &$crate::support::gui::InputGate::production(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                $crate::support::gui::skip("the user is using the computer");
+                return;
+            }
+        };
+    };
+}
+
 use std::time::{Duration, Instant};
 
 use plnk::gfx::Rgba8;
@@ -51,6 +73,7 @@ use windows::core::PCWSTR;
 #[test]
 #[ignore = "creates real topmost windows on the desktop"]
 fn toolbar_slides_exits_and_docks_without_per_frame_callbacks() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let settings = Settings::defaults();
     // Far from the screen edge so the whole slide is visible.
@@ -539,6 +562,7 @@ fn toolbar_slides_exits_and_docks_without_per_frame_callbacks() {
 #[test]
 #[ignore = "writes a screenshot of the toolbar to %TEMP%"]
 fn capture_toolbar_preview() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let mut settings = Settings::defaults();
     // Twice the default height makes the icons legible in the screenshot; the

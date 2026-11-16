@@ -21,6 +21,28 @@
 //! Run the decision-gate probe in Release with:
 //! `cargo test --release --manifest-path plnk/Cargo.toml --test ui_smoke -- --ignored --test-threads=1 graphics_gate_probe --nocapture`
 
+#[path = "support/mod.rs"]
+mod support;
+
+/// Yields the desktop or returns early with a SKIP marker.
+///
+/// Expands to a `let` binding so the guard lives for the rest of the test body
+/// and its `Drop` restores the pointer. Kept as a macro so all desktop tests
+/// express the gate identically and a future change lands in one place.
+macro_rules! acquire_desktop {
+    () => {
+        let _desktop_guard = match $crate::support::gui::DesktopGuard::acquire(
+            &$crate::support::gui::InputGate::production(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                $crate::support::gui::skip("the user is using the computer");
+                return;
+            }
+        };
+    };
+}
+
 use std::time::{Duration, Instant};
 
 use plnk::gfx::device::GraphicsDevice;
@@ -56,6 +78,7 @@ use windows::core::PCWSTR;
 #[test]
 #[ignore = "creates real topmost windows on the desktop"]
 fn transparent_overlay_accepts_and_passes_input_by_mode() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let evidence = overlay_evidence(&device);
 
@@ -111,6 +134,7 @@ fn transparent_overlay_accepts_and_passes_input_by_mode() {
 #[test]
 #[ignore = "creates real topmost windows on the desktop"]
 fn toolbar_animation_has_no_per_frame_app_callback() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let evidence = animation_evidence(&device);
 
@@ -278,6 +302,7 @@ fn monotonic_clock_is_non_decreasing() {
 #[test]
 #[ignore = "decision-gate probe: real desktop windows and ~10s of measurements"]
 fn graphics_gate_probe() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
 
     // --- Physical coordinates on the real window system -------------------

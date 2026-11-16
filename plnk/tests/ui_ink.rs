@@ -28,6 +28,28 @@
 //! Run the probe in Release with:
 //! `cargo test --release --manifest-path plnk/Cargo.toml --test ui_ink -- --ignored --test-threads=1 ink_mvp_probe --nocapture`
 
+#[path = "support/mod.rs"]
+mod support;
+
+/// Yields the desktop or returns early with a SKIP marker.
+///
+/// Expands to a `let` binding so the guard lives for the rest of the test body
+/// and its `Drop` restores the pointer. Kept as a macro so all desktop tests
+/// express the gate identically and a future change lands in one place.
+macro_rules! acquire_desktop {
+    () => {
+        let _desktop_guard = match $crate::support::gui::DesktopGuard::acquire(
+            &$crate::support::gui::InputGate::production(),
+        ) {
+            Some(guard) => guard,
+            None => {
+                $crate::support::gui::skip("the user is using the computer");
+                return;
+            }
+        };
+    };
+}
+
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -207,6 +229,7 @@ fn contact_cancel_does_not_commit_partial_history() {
 #[test]
 #[ignore = "creates real topmost DirectComposition windows on the desktop"]
 fn present_only_submits_dirty_region() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(250, 250, 640, 360);
 
@@ -295,6 +318,7 @@ fn present_only_submits_dirty_region() {
 #[test]
 #[ignore = "creates real topmost DirectComposition windows on the desktop"]
 fn pointer_timestamp_to_submit_is_monotonic() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(260, 260, 480, 320);
     let mut surface = InkSurface::new(&device, bounds).expect("ink surface");
@@ -398,6 +422,7 @@ fn pointer_timestamp_to_submit_is_monotonic() {
 #[test]
 #[ignore = "moves the real cursor and clicks real toolbar buttons on the desktop"]
 fn mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let settings = Settings::defaults();
     let bounds = PhysicalRect::from_xywh(300, 220, 800, 420);
@@ -548,6 +573,7 @@ fn mvp_end_to_end_mouse_writing_selects_undo_clear_and_exits() {
 #[test]
 #[ignore = "creates a real DirectComposition overlay and injects real mouse input"]
 fn live_stroke_is_continuous_mid_drag_and_commits_on_release() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(300, 300, 900, 420);
     let original_cursor = cursor_position();
@@ -651,6 +677,7 @@ fn live_stroke_is_continuous_mid_drag_and_commits_on_release() {
 #[test]
 #[ignore = "creates a real overlay and reads back screen pixels during a drag"]
 fn live_stroke_pixels_match_committed_render_for_all_stroke_shapes() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(280, 280, 1040, 560);
     let original_cursor = cursor_position();
@@ -870,6 +897,7 @@ fn assert_live_pixels_match(
 #[test]
 #[ignore = "creates a real topmost overlay and inspects the OS cursor"]
 fn drawing_overlay_cursor_is_pen_cursor_never_wait_cursor() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(500, 500, 520, 320);
     let original_cursor = cursor_position();
@@ -922,6 +950,7 @@ fn drawing_overlay_cursor_is_pen_cursor_never_wait_cursor() {
 #[test]
 #[ignore = "launches the real plnk.exe and draws on the desktop with real input"]
 fn mvp_real_app_launch_draws_and_exits_cleanly() {
+    acquire_desktop!();
     // White backdrop under the app's overlay so any non-white pixel inside the
     // region is unambiguous ink, independent of the user's imported pen colors.
     let device = GraphicsDevice::new().expect("create graphics device");
@@ -1038,6 +1067,7 @@ fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> std::pro
 #[test]
 #[ignore = "creates real topmost windows and reads back screen pixels"]
 fn renderer_caps_dots_and_highlighter_blend_are_visible() {
+    acquire_desktop!();
     let device = GraphicsDevice::new().expect("create graphics device");
     let bounds = PhysicalRect::from_xywh(400, 400, 460, 220);
     let mut backdrop = BackdropWindow::new(&device, bounds).expect("backdrop window");
@@ -1160,6 +1190,7 @@ fn renderer_caps_dots_and_highlighter_blend_are_visible() {
 #[test]
 #[ignore = "creates a real full-monitor overlay and clicks at the screen edge"]
 fn overlay_covers_true_physical_monitor_and_accepts_input_at_edges() {
+    acquire_desktop!();
     // REGRESSION (fix round 1): `current_monitor_rect` must establish DPI
     // awareness before it queries the monitor. In an unaware process a scaled
     // display reports its virtualized logical size (1707x1067 instead of
@@ -1258,6 +1289,7 @@ fn overlay_covers_true_physical_monitor_and_accepts_input_at_edges() {
 #[test]
 #[ignore = "release probe: full-screen surface, 1000 strokes, latency sampling"]
 fn ink_mvp_probe() {
+    acquire_desktop!();
     if cfg!(debug_assertions) {
         // Spec §4.2/§8: performance probes are Release-only. The debug build
         // would measure unoptimized code and report numbers the spec explicitly
@@ -1912,6 +1944,7 @@ impl Drop for ScreenRegion {
 #[test]
 #[ignore = "launches the real app and clicks toolbar buttons with routed OS input"]
 fn real_app_toolbar_buttons_work_after_drawing() {
+    acquire_desktop!();
     let exe = env!("CARGO_BIN_EXE_plnk");
     let log_path = app_log_path(exe);
     let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
@@ -1985,6 +2018,7 @@ fn real_app_toolbar_buttons_work_after_drawing() {
 #[test]
 #[ignore = "launches the real app and sends a real Esc key"]
 fn real_app_escape_exits_annotation() {
+    acquire_desktop!();
     let exe = env!("CARGO_BIN_EXE_plnk");
     let log_path = app_log_path(exe);
     let log_start = std::fs::metadata(&log_path).map_or(0, |meta| meta.len());
@@ -2104,6 +2138,7 @@ fn last_active_pen_width(path: &std::path::Path, start: u64) -> Option<f32> {
 #[test]
 #[ignore = "uses real mouse drags on the pen-width slider and real Esc keys"]
 fn real_app_pen_width_slider_and_escape_priority_work() {
+    acquire_desktop!();
     // This test computes window rectangles and injects absolute input itself,
     // so its own process must see physical pixels like pmv2 plnk windows;
     // otherwise the slider drag lands at virtualized coordinates.
@@ -2273,6 +2308,7 @@ fn send_escape() {
 #[test]
 #[ignore = "opt-in: drives the running legacy gInk and the real plnk app"]
 fn capture_fixed_strokes_side_by_side() {
+    acquire_desktop!();
     if std::env::var("PLNK_CAPTURE_LEGACY").ok().as_deref() != Some("1") {
         println!("capture skipped; set PLNK_CAPTURE_LEGACY=1 to drive both apps");
         return;
