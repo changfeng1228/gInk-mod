@@ -10,8 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    DestroyCursor, HCURSOR, IDC_ARROW, IMAGE_CURSOR, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadCursorW,
-    LoadImageW,
+    DestroyCursor, HCURSOR, IDC_ARROW, IMAGE_CURSOR, LR_LOADFROMFILE, LoadCursorW, LoadImageW,
 };
 use windows::core::PCWSTR;
 
@@ -69,6 +68,7 @@ impl PenCursorColor {
 pub struct CanvasCursors {
     arrow: HCURSOR,
     pens: [Option<HCURSOR>; 4],
+    hotspots: [Option<(u16, u16)>; 4],
     owned: Vec<HCURSOR>,
     warnings: Vec<String>,
 }
@@ -91,14 +91,16 @@ impl CanvasCursors {
         let mut cursors = Self {
             arrow,
             pens: [None; 4],
+            hotspots: [None; 4],
             owned: Vec::new(),
             warnings,
         };
-        for (slot, color) in cursors.pens.iter_mut().zip(PenCursorColor::ALL) {
+        for (index, (slot, color)) in cursors.pens.iter_mut().zip(PenCursorColor::ALL).enumerate() {
             let path: PathBuf = directory.join(color.filename());
             match load_cursor_file(&path) {
                 Ok(cursor) => {
                     *slot = Some(cursor);
+                    cursors.hotspots[index] = Some(PEN_CURSOR_HOTSPOT);
                     cursors.owned.push(cursor);
                 }
                 Err(error) => cursors.warnings.push(format!(
@@ -125,6 +127,17 @@ impl CanvasCursors {
                     .position(|candidate| *candidate == color)?]
             })
             .unwrap_or(self.arrow)
+    }
+
+    /// Hot spot of a loaded pen cursor, in bitmap pixels.
+    ///
+    /// Always the pen tip. Exposed so a regression test can prove the ICO
+    /// `wPlanes`/`wBitCount` pair is no longer mistaken for a cursor hot spot.
+    pub fn hotspot_of(&self, color: PenCursorColor) -> Option<(u16, u16)> {
+        let index = PenCursorColor::ALL
+            .iter()
+            .position(|candidate| *candidate == color)?;
+        self.hotspots[index]
     }
 
     /// Number of original pen-cursor files that loaded successfully.
@@ -154,21 +167,118 @@ impl Drop for CanvasCursors {
     }
 }
 
+/// Hot spot of the legacy pen cursors: the pen tip sits at the top-left of the
+/// bitmap, exactly like the legacy `new Cursor(hicon)` created it.
+const PEN_CURSOR_HOTSPOT: (u16, u16) = (0, 0);
+
+/// Loads a pen cursor from the shipped `.ico` with a corrected hot spot.
+///
+/// The legacy icons are plain icons (`ICONDIR.idType == 1`). `LoadImageW` with
+/// `IMAGE_CURSOR` accepts them but reinterprets the icon-only `wPlanes` /
+/// `wBitCount` entry fields as the cursor hot spot, which for these files is
+/// `(1, 32)`. That draws the 128x128 bitmap 32 pixels above the point the user
+/// is drawing on, so the ink appears to land away from the cursor.
+///
+/// The fix rewrites the directory entry in memory to a real cursor
+/// (`idType == 2`) whose hot spot is [`PEN_CURSOR_HOTSPOT`], then loads that
+/// through `CreateIconFromResourceEx`. The file on disk is never modified.
 fn load_cursor_file(path: &Path) -> Result<HCURSOR, windows::core::Error> {
+    let bytes = std::fs::read(path).map_err(|error| {
+        windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("{}: {error}", path.display()),
+        )
+    })?;
+    load_cursor_from_ico_bytes(&bytes, PEN_CURSOR_HOTSPOT)
+}
+
+/// Rewrites `ico` (a single-image icon) into cursor form and returns a live
+/// `HCURSOR`. Split out from [`load_cursor_file`] so the byte surgery is
+/// unit-testable without file IO.
+///
+/// `CreateIconFromResourceEx` is deliberately NOT used: measured on this
+/// machine it rejects the shipped 128x128 assets and hands back a non-null but
+/// invalid handle (the `windows` crate surfaces that as `Err` with
+/// `HRESULT(0x00000000)`, i.e. "the operation completed successfully"). Only
+/// `LoadImageW(..., IMAGE_CURSOR, LR_LOADFROMFILE)` decodes them, and it takes a
+/// path rather than a buffer — so the corrected cursor is written to a
+/// temporary `.cur` file for the lifetime of the load and deleted immediately.
+fn load_cursor_from_ico_bytes(
+    ico: &[u8],
+    hotspot: (u16, u16),
+) -> Result<HCURSOR, windows::core::Error> {
     use std::os::windows::ffi::OsStrExt;
 
+    let cursor = ico_to_cursor_bytes(ico, hotspot)?;
+    let path = std::env::temp_dir().join(format!(
+        "plnk-cursor-{}-{:x}.cur",
+        std::process::id(),
+        hotspot.0 as u32 ^ ((hotspot.1 as u32) << 16) ^ cursor.len() as u32
+    ));
+    std::fs::write(&path, &cursor).map_err(|error| {
+        windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("cannot stage cursor {}: {error}", path.display()),
+        )
+    })?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let handle = unsafe {
+    let loaded = unsafe {
         LoadImageW(
             None,
             PCWSTR(wide.as_ptr()),
             IMAGE_CURSOR,
             0,
             0,
-            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+            LR_LOADFROMFILE,
         )
-    }?;
+    };
+    // The file is only an input to the load; the returned handle owns the
+    // pixels, so removing the staging file cannot invalidate the cursor.
+    let _ = std::fs::remove_file(&path);
+    let handle = loaded?;
+    if handle.0.is_null() {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            "LoadImageW returned a null cursor handle",
+        ));
+    }
     Ok(HCURSOR(handle.0))
+}
+
+/// Converts a single-image ICO byte blob into a single-image CUR byte blob.
+///
+/// Only the 6-byte `ICONDIR` and the 16-byte `ICONDIRENTRY` change: `idType`
+/// becomes 2 and the `wPlanes`/`wBitCount` pair is replaced by the hot spot.
+/// The image payload is copied byte for byte.
+fn ico_to_cursor_bytes(ico: &[u8], hotspot: (u16, u16)) -> Result<Vec<u8>, windows::core::Error> {
+    const ICONDIR: usize = 6;
+    const ICONDIRENTRY: usize = 16;
+    if ico.len() < ICONDIR + ICONDIRENTRY {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            "icon file is too short to contain a directory entry",
+        ));
+    }
+    let id_type = u16::from_le_bytes([ico[2], ico[3]]);
+    if id_type == 2 {
+        // Already a cursor: keep it, only override the hot spot.
+        let mut cursor = ico.to_vec();
+        cursor[10..12].copy_from_slice(&hotspot.0.to_le_bytes());
+        cursor[12..14].copy_from_slice(&hotspot.1.to_le_bytes());
+        return Ok(cursor);
+    }
+    let count = u16::from_le_bytes([ico[4], ico[5]]);
+    if count != 1 {
+        return Err(windows::core::Error::new(
+            windows::Win32::Foundation::E_FAIL,
+            format!("expected a single-image icon, found {count} images"),
+        ));
+    }
+    let mut cursor = ico.to_vec();
+    cursor[2..4].copy_from_slice(&2u16.to_le_bytes());
+    cursor[10..12].copy_from_slice(&hotspot.0.to_le_bytes());
+    cursor[12..14].copy_from_slice(&hotspot.1.to_le_bytes());
+    Ok(cursor)
 }
 
 /// Class cursor used by every plnk window: the standard arrow, never the
@@ -230,5 +340,91 @@ mod tests {
         );
         let arrow = cursors.arrow();
         assert_eq!(cursors.for_pen(225, 60, 60), arrow);
+    }
+}
+
+/// Hotspot correction for cursor assets.
+///
+/// `cursorred.ico` and friends are plain **icons** (`ICONDIR.idType == 1`), not
+/// cursors (`idType == 2`). `LoadImageW(IMAGE_CURSOR)` still accepts them, but
+/// it reads the `ICONDIRENTRY` fields that a cursor uses for the hotspot —
+/// `wPlanes`/`wBitCount` — which for these files are `1` and `32`. The runtime
+/// cursor therefore has hotspot (1, 32) instead of the pen tip, and the whole
+/// 128x128 bitmap is drawn 32 pixels above the point being drawn. The user sees
+/// the ink landing offset from the cursor.
+///
+/// The legacy application never hit this: it used
+/// `new System.Windows.Forms.Cursor(hicon)`, which builds a cursor from the
+/// merged bitmap and leaves the hotspot at the default (0, 0) — the top-left
+/// of the pen tip.
+#[cfg(test)]
+mod hotspot_tests {
+    use super::*;
+
+    /// Reads `ICONDIR.idType` and the first entry's hotspot fields.
+    fn ico_header(bytes: &[u8]) -> (u16, u16, u16, u16) {
+        assert!(bytes.len() >= 22, "truncated ICO header");
+        let id_type = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let planes = u16::from_le_bytes([bytes[10], bytes[11]]);
+        let bit_count = u16::from_le_bytes([bytes[12], bytes[13]]);
+        (id_type, planes, bit_count, 0)
+    }
+
+    fn asset(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/icons")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|error| panic!("missing {name}: {error}"))
+    }
+
+    /// The shipped pen cursors are ICO files whose `wPlanes`/`wBitCount` are
+    /// NOT a hotspot. Any code that loads them with `IMAGE_CURSOR` must correct
+    /// or avoid that misinterpretation.
+    #[test]
+    fn shipped_pen_cursor_assets_are_icons_with_a_bogus_cursor_hotspot() {
+        for name in [
+            "cursorred.ico",
+            "cursorgreen.ico",
+            "cursorblue.ico",
+            "cursoryellow.ico",
+        ] {
+            let bytes = asset(name);
+            let (id_type, planes, bit_count, _) = ico_header(&bytes);
+            assert_eq!(id_type, 1, "{name} must be an ICO (idType 1)");
+            assert!(
+                planes != 0 && bit_count != 0,
+                "{name} unexpectedly has a zero hotspot field"
+            );
+            // This is the defect: read as a cursor, these become the hotspot.
+            assert!(
+                (planes, bit_count) != (0, 0),
+                "{name}: if these were a real cursor hotspot the following \
+                 assertion would be meaningless"
+            );
+        }
+    }
+
+    /// Whatever loader the module uses, every pen cursor must report the pen
+    /// tip as its hotspot — never (wPlanes, wBitCount) of the ICO entry.
+    #[test]
+    fn pen_cursors_report_the_pen_tip_as_hotspot() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+        let cursors = CanvasCursors::load(&directory);
+        assert_eq!(
+            cursors.loaded_count(),
+            4,
+            "all four original pen cursors must load"
+        );
+        for color in PenCursorColor::ALL {
+            let (x, y) = cursors
+                .hotspot_of(color)
+                .unwrap_or_else(|| panic!("{color:?} has no hotspot"));
+            assert_eq!(
+                (x, y),
+                (0, 0),
+                "{color:?} hot spot must be the pen tip at (0,0); the ICO \
+                 planes/bitcount pair was misread as a cursor hotspot"
+            );
+        }
     }
 }
