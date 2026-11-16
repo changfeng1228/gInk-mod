@@ -167,9 +167,18 @@ impl Drop for CanvasCursors {
     }
 }
 
-/// Hot spot of the legacy pen cursors: the pen tip sits at the top-left of the
-/// bitmap, exactly like the legacy `new Cursor(hicon)` created it.
-const PEN_CURSOR_HOTSPOT: (u16, u16) = (0, 0);
+/// Hot spot of the legacy pen cursors, in bitmap pixels.
+///
+/// The shipped 128x128 pen bitmaps are not full-canvas: the pen tip occupies
+/// the top-right quadrant, and the bottom-left quarter is fully transparent
+/// (measured on `cursorred.ico`: opaque pixels span x 64..=127, y 0..=63, and
+/// the tip apex is at x 109..=112 on row 0). The hot spot must therefore be the
+/// tip apex, not the bitmap origin.
+///
+/// Placing it at (0, 0) -- which is what an earlier revision did -- leaves the
+/// pointer's hotspot inside the transparent corner, so the visible pen is drawn
+/// 110 pixels to the right of where the user is drawing.
+const PEN_CURSOR_HOTSPOT: (u16, u16) = (110, 0);
 
 /// Loads a pen cursor from the shipped `.ico` with a corrected hot spot.
 ///
@@ -421,9 +430,15 @@ mod hotspot_tests {
                 .unwrap_or_else(|| panic!("{color:?} has no hotspot"));
             assert_eq!(
                 (x, y),
-                (0, 0),
-                "{color:?} hot spot must be the pen tip at (0,0); the ICO \
-                 planes/bitcount pair was misread as a cursor hotspot"
+                PEN_CURSOR_HOTSPOT,
+                "{color:?} hot spot must be {PEN_CURSOR_HOTSPOT:?}"
+            );
+            // The bitmap's bottom-left quarter is transparent, so a hot spot in
+            // that corner would draw the visible pen far from the point the
+            // user is drawing on.
+            assert!(
+                x > 0 || y > 0,
+                "{color:?} hot spot must not sit in the transparent corner"
             );
         }
     }
