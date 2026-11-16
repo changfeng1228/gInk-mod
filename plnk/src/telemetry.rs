@@ -13,6 +13,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::settings_store::resolve_data_directory;
+
+/// File name of the crash/startup diagnostics log under the data directory.
+pub const CRASH_LOG_FILE_NAME: &str = "plnk-crash.log";
+/// Upper bound of the crash log. The panic hook can run at any point, so the
+/// file is truncated to its newest bytes on every write instead of rotating.
+pub const CRASH_LOG_MAX_BYTES: usize = 64 * 1024;
+
 /// Smallest file size accepted by [`LogPolicy`]. A line is truncated to fit one
 /// empty file, so the bound (`max_file_bytes * max_files`) always holds.
 const MIN_FILE_BYTES: u64 = 64;
@@ -271,6 +279,137 @@ fn truncate_utf8(text: &mut String, max_bytes: usize) {
     text.truncate(end);
 }
 
+/// Installs the early crash hook used by `main`.
+///
+/// The release binary is a GUI-subsystem executable, so a panic message on
+/// stderr would be invisible. The hook appends one timestamped line with the
+/// panic text and source location to [`CRASH_LOG_FILE_NAME`] under the same
+/// data directory as the settings and the normal log. It is best effort: any
+/// failure (read-only directory, locked file, allocation) is ignored, and the
+/// process then terminates with Rust's normal panic behaviour.
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let message = panic_payload_message(info.payload());
+        let line = format!("{} PANIC at {location}: {message}", timestamp_now());
+        // A development console still sees the conventional panic text; the
+        // crash log is what survives in a double-clicked GUI build. `writeln!`
+        // is used instead of `eprintln!` so a closed/invalid stderr handle can
+        // never panic inside the hook.
+        let _ = writeln!(io::stderr(), "plnk: {line}");
+        if let Some(directory) = resolve_data_directory() {
+            let _ = append_crash_line(&directory, &line);
+        }
+    }));
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
+/// Records that this process exited because another plnk instance already owns
+/// the singleton.
+///
+/// A second instance never opens the first instance's normal log, so this
+/// writes to the crash log instead. It is best effort and must never keep
+/// startup alive or fail it when the file is locked.
+pub fn log_second_instance_exit() {
+    if let Some(directory) = resolve_data_directory() {
+        let line = format!(
+            "{} INFO second instance (pid {}) exited; another instance is running",
+            timestamp_now(),
+            std::process::id()
+        );
+        let _ = append_crash_line(&directory, &line);
+    }
+}
+
+/// Appends one diagnostics line to `<data_directory>/plnk-crash.log`.
+///
+/// This log is independent from [`LogSink`] on purpose: the panic hook may run
+/// before the main log exists, and a second instance never opens the first
+/// instance's log. The file is bounded to the newest [`CRASH_LOG_MAX_BYTES`]
+/// bytes, so a crash loop cannot grow it without limit.
+pub fn append_crash_line(data_directory: &Path, line: &str) -> io::Result<()> {
+    append_crash_line_with_limit(data_directory, line, CRASH_LOG_MAX_BYTES)
+}
+
+fn append_crash_line_with_limit(
+    data_directory: &Path,
+    line: &str,
+    max_bytes: usize,
+) -> io::Result<()> {
+    let max_bytes = max_bytes.max(1);
+    fs::create_dir_all(data_directory)?;
+    let path = data_directory.join(CRASH_LOG_FILE_NAME);
+
+    // Keep the new line even when it alone exceeds the bound; truncate its
+    // tail so the timestamp and the panic location at the front stay visible.
+    let mut line = line.replace(['\r', '\n'], " ").into_bytes();
+    if line.len() + 1 > max_bytes {
+        truncate_bytes(&mut line, max_bytes - 1);
+    }
+    line.push(b'\n');
+
+    let mut contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let keep = max_bytes - line.len();
+    let start = tail_start_after_line_break(&contents, keep);
+    contents.drain(..start);
+    contents.extend_from_slice(&line);
+    // One truncating write keeps the file bounded even if an earlier crash
+    // left it oversized; by construction it can never exceed the limit.
+    fs::write(&path, contents)
+}
+
+/// Start index of the newest `max_bytes` bytes, preferring a line boundary.
+/// A partial multi-byte character is skipped when no line break is available.
+fn tail_start_after_line_break(bytes: &[u8], max_bytes: usize) -> usize {
+    if bytes.len() <= max_bytes {
+        return 0;
+    }
+    let mut start = bytes.len() - max_bytes;
+    if let Some(offset) = bytes[start..].iter().position(|byte| *byte == b'\n') {
+        start += offset + 1;
+    } else {
+        while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+            start += 1;
+        }
+    }
+    start
+}
+
+/// Truncates `bytes` on a UTF-8 character boundary.
+fn truncate_bytes(bytes: &mut Vec<u8>, max_bytes: usize) {
+    if bytes.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    bytes.truncate(end);
+}
+
 fn timestamp_now() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -307,4 +446,103 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let month = month_prime + if month_prime < 10 { 3 } else { -9 };
     let year = year + if month <= 2 { 1 } else { 0 };
     (year, month as u32, day as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use super::*;
+
+    fn temp_directory(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "plnk-crash-log-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("create the crash-log test directory");
+        directory
+    }
+
+    /// The crash log keeps only the newest bytes: old lines fall out of the
+    /// retained window, the newest line survives, and the file never exceeds
+    /// the bound.
+    #[test]
+    fn crash_log_truncation_keeps_newest_line_within_bound() {
+        let directory = temp_directory("truncate");
+        let path = directory.join(CRASH_LOG_FILE_NAME);
+        let limit = 256;
+        for index in 0..50 {
+            append_crash_line_with_limit(
+                &directory,
+                &format!("2026-01-01T00:00:00Z PANIC line {index} {}", "x".repeat(40)),
+                limit,
+            )
+            .expect("append a crash line");
+        }
+
+        let bytes = fs::read(&path).expect("read the crash log");
+        assert!(
+            bytes.len() <= limit,
+            "crash log must stay within {limit} bytes, found {}",
+            bytes.len()
+        );
+        let text = String::from_utf8(bytes).expect("line-boundary truncation keeps UTF-8");
+        assert!(
+            text.contains("PANIC line 49"),
+            "the newest line must be kept: {text:?}"
+        );
+        assert!(
+            !text.contains("PANIC line 0 "),
+            "old lines must be dropped: {text:?}"
+        );
+        assert!(!text.is_empty(), "the newest line must not be dropped");
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// A single panic message larger than the whole log is truncated from the
+    /// tail, but its timestamp/location head stays readable.
+    #[test]
+    fn oversized_crash_line_is_truncated_but_keeps_its_head() {
+        let directory = temp_directory("oversized");
+        let path = directory.join(CRASH_LOG_FILE_NAME);
+        let line = format!(
+            "2026-01-01T00:00:00Z PANIC at src/main.rs:1:1: {}",
+            "y".repeat(1024)
+        );
+        append_crash_line_with_limit(&directory, &line, 128).expect("append an oversized line");
+
+        let bytes = fs::read(&path).expect("read the crash log");
+        assert!(
+            bytes.len() <= 128,
+            "oversized crash line must be bounded: {} bytes",
+            bytes.len()
+        );
+        let text = String::from_utf8(bytes).expect("truncation keeps UTF-8");
+        assert!(
+            text.starts_with("2026-01-01T00:00:00Z PANIC at src/main.rs:1:1:"),
+            "the timestamp and location must survive: {text:?}"
+        );
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// Truncation must never split a multi-byte character.
+    #[test]
+    fn crash_log_truncation_preserves_utf8() {
+        let directory = temp_directory("utf8");
+        let path = directory.join(CRASH_LOG_FILE_NAME);
+        for index in 0..20 {
+            append_crash_line_with_limit(&directory, &format!("PANIC 中文消息 {index}"), 64)
+                .expect("append a non-ASCII crash line");
+            let bytes = fs::read(&path).expect("read the crash log");
+            assert!(
+                bytes.len() <= 64,
+                "crash log must stay bounded with non-ASCII text: {} bytes",
+                bytes.len()
+            );
+            String::from_utf8(bytes).expect("truncation must not split a UTF-8 character");
+        }
+        let _ = fs::remove_dir_all(&directory);
+    }
 }

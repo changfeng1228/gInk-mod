@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use plnk::app::{
-    AppMode, IO_RESULT_MESSAGE, InstanceGuard, IoCompletion, IoResult, IoSubmitError, IoWorker,
-    PostMessageCompletion, RunOptions,
+    AppMode, IO_RESULT_MESSAGE, InstanceDecision, InstanceGuard, IoCompletion, IoResult,
+    IoSubmitError, IoWorker, PostMessageCompletion, RunOptions, decide_instance,
 };
 use plnk::hotkeys::{Command, GlobalHotkeys, HotkeyIssueKind, HotkeyMap, KeyboardEvent};
 use plnk::settings::{Hotkey, HotkeyKey, Settings};
@@ -68,6 +68,52 @@ fn second_instance_does_not_replace_first() {
     assert!(
         after.is_some(),
         "dropping the first guard must release the singleton mutex"
+    );
+}
+
+/// The second-instance check is UI-free: `decide_instance` maps a refused
+/// acquisition to `AlreadyRunning` (which `main` renders as a message box),
+/// and an owned acquisition to `Primary`. No modal window is created here.
+#[test]
+fn second_instance_decision_is_ui_free() {
+    let name = format!(
+        "Local\\plnk-lifecycle-decision-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    );
+
+    let first = InstanceGuard::acquire(&name)
+        .expect("creating the decision mutex must not fail")
+        .expect("the first instance acquires the mutex");
+
+    // A Windows mutex is recursive for its owning thread, so the "second
+    // instance" must acquire from another thread, like a second process.
+    let already_running = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let acquired = InstanceGuard::acquire(&name).expect("second CreateMutexW");
+                matches!(decide_instance(acquired), InstanceDecision::AlreadyRunning)
+            })
+            .join()
+            .expect("second instance thread")
+    });
+    assert!(
+        already_running,
+        "a refused acquisition must map to AlreadyRunning"
+    );
+    assert!(
+        matches!(
+            decide_instance(None::<InstanceGuard>),
+            InstanceDecision::AlreadyRunning
+        ),
+        "the absent-guard case is the second-instance path"
+    );
+
+    drop(first);
+    let acquired = InstanceGuard::acquire(&name).expect("CreateMutexW after the first exited");
+    assert!(
+        matches!(decide_instance(acquired), InstanceDecision::Primary(_)),
+        "the owner must map to Primary"
     );
 }
 

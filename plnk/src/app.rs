@@ -304,9 +304,9 @@ impl App {
     pub fn run_with(settings: Settings, options: RunOptions) -> Result<(), AppError> {
         let instance = InstanceGuard::acquire(INSTANCE_MUTEX_NAME).map_err(AppError::Instance)?;
         let Some(instance) = instance else {
-            // Legacy behaviour: a second copy exits silently and never touches
-            // the first instance's tray icon, hotkeys or log.
-            eprintln!("plnk: another instance is already running");
+            // A second copy never touches the first instance's tray icon,
+            // hotkeys or log; it only reports why it is exiting.
+            report_already_running();
             return Ok(());
         };
         Self::run_with_instance(settings, options, instance)
@@ -420,6 +420,50 @@ impl Drop for InstanceGuard {
         unsafe {
             let _ = ReleaseMutex(self.handle);
             let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Outcome of the single-instance check.
+///
+/// Deliberately UI-free so tests can assert the mapping without opening a
+/// modal message box; `main` renders [`Self::AlreadyRunning`] visibly.
+pub enum InstanceDecision {
+    /// This process owns the singleton; the guard must stay alive.
+    Primary(InstanceGuard),
+    /// Another instance is already running; this process must exit
+    /// successfully without touching settings or the first instance's log.
+    AlreadyRunning,
+}
+
+/// Maps a singleton acquisition result to the process decision.
+pub fn decide_instance(acquired: Option<InstanceGuard>) -> InstanceDecision {
+    match acquired {
+        Some(guard) => InstanceDecision::Primary(guard),
+        None => InstanceDecision::AlreadyRunning,
+    }
+}
+
+/// User-visible feedback for the second-instance exit path.
+///
+/// The second instance performs no settings work, so this is its only visible
+/// trace: one line on stderr, one best-effort crash-log entry, and — outside
+/// test builds — an information box explaining that plnk is already running.
+/// The box is compiled out of test binaries so no automated test can block on
+/// a modal window.
+pub fn report_already_running() {
+    eprintln!("plnk: another instance is already running");
+    crate::telemetry::log_second_instance_exit();
+    #[cfg(not(test))]
+    {
+        let text = HSTRING::from("plnk 已在运行，请查看系统托盘图标。");
+        unsafe {
+            MessageBoxW(
+                None,
+                &text,
+                w!("plnk"),
+                MB_OK | windows::Win32::UI::WindowsAndMessaging::MB_ICONINFORMATION,
+            );
         }
     }
 }

@@ -82,6 +82,16 @@ fn ensure_writable_directory(root: &Path) -> io::Result<()> {
     result
 }
 
+/// Best-effort resolution of the writable data directory for diagnostics that
+/// must work before settings are loaded (the crash log) or from a second
+/// instance that never opens the settings store.
+///
+/// Uses exactly the roots of [`StorageRoots::from_environment`]; any failure
+/// (read-only medium, missing profile) yields `None` instead of a panic.
+pub fn resolve_data_directory() -> Option<PathBuf> {
+    StorageRoots::from_environment().resolve().ok()
+}
+
 /// Owns the new settings location plus the imported legacy source documents.
 pub struct SettingsStore {
     storage: StorageRoots,
