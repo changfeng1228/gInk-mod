@@ -1,3 +1,18 @@
+> **本仓库有两个实现，先确认你在看哪一个：**
+>
+> | 实现 | 路径 | 语言 | 状态 |
+> |---|---|---|---|
+> | **plnk**（现行） | `plnk/` | Rust 1.100 MSVC + `windows` crate | 开发中，任务 8–14 未实现 |
+> | gInk（旧版） | `src/`、`gInk.sln`、`build/` | C# WinForms + Microsoft.Ink | 功能完整的参照实现 |
+>
+> - **构建/测试/发布 plnk**：见 `docs/release.md`（`cargo test --manifest-path plnk/Cargo.toml`）。
+> - 构建/打包入口脚本：`scripts/package-plnk.ps1`、`scripts/verify-plnk-package.ps1`、`scripts/check-parity.ps1`。
+> - 本文件其余部分描述的是 **gInk 旧版**，保留作为行为参照。
+>
+> 功能对齐基线见 `docs/parity-matrix.md`；重写计划见 `docs/superpowers/plans/`。
+
+---
+
 # gInk 1.1.1 + 截图钉图升级 — 项目边界说明
 
 本目录是 gInk 的**源码工作副本**，在上游 gInk 1.1.1 基础上增加了「截图钉图」功能。

@@ -585,3 +585,93 @@ fn every_toolbar_state_maps_to_an_original_legacy_png() {
         }
     }
 }
+
+/// The packaging script hard-asserts the number of icon assets it copies, so a
+/// stale count turns every release build into a hard failure ("Unexpected
+/// packaged asset count"). Removing an icon therefore has to move the number in
+/// `scripts/package-plnk.ps1` in the same change.
+///
+/// This test is the guard for exactly that coupling: it reads the expected
+/// count out of the script instead of duplicating it, so the two can never
+/// drift apart again.
+#[test]
+fn package_script_icon_count_matches_assets_on_disk() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = manifest.join("../scripts/package-plnk.ps1");
+    let text = std::fs::read_to_string(&script)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", script.display()));
+
+    // The assertion is written as `if ($assetCount -ne <N>)`.
+    let marker = "-ne ";
+    let expected: usize = text
+        .lines()
+        .find(|line| line.contains("$assetCount") && line.contains(marker))
+        .and_then(|line| {
+            let rest = &line[line.find(marker)? + marker.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "{} has no `$assetCount -ne <N>` assertion; the packaging gate moved",
+                script.display()
+            )
+        });
+
+    let icons = manifest.join("assets/icons");
+    let mut names: Vec<String> = std::fs::read_dir(&icons)
+        .unwrap_or_else(|error| panic!("cannot list {}: {error}", icons.display()))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+
+    assert_eq!(
+        names.len(),
+        expected,
+        "scripts/package-plnk.ps1 expects {expected} icon assets but {} are on disk: {names:?}.\n\
+         Update the `$assetCount -ne` assertion whenever an icon is added or removed.",
+        names.len()
+    );
+}
+
+/// Every icon the runtime actually loads must still exist. Deleting a tracked
+/// asset is fine only while no code names it, so this pins the 19 toolbar
+/// bitmaps, the pen-width panel bitmap and the four pen cursors.
+#[test]
+fn every_runtime_loaded_icon_still_exists() {
+    let icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icons");
+    let loaded = [
+        "cursorblue.ico",
+        "cursorgreen.ico",
+        "cursorred.ico",
+        "cursoryellow.ico",
+        "dock.png",
+        "dockback.png",
+        "eraser.png",
+        "eraseract.png",
+        "exit.png",
+        "garbage.png",
+        "highlighter1.png",
+        "highlighter_act.png",
+        "icon_red.ico",
+        "icon_white.ico",
+        "pan.png",
+        "pan_act.png",
+        "pencil1.png",
+        "pencil_act.png",
+        "penwidth.png",
+        "penwidthpanel.png",
+        "pointer1.png",
+        "pointer_act.png",
+        "snap.png",
+        "undo.png",
+        "visible.png",
+        "visible_not.png",
+    ];
+    for name in loaded {
+        let path = icons.join(name);
+        assert!(path.is_file(), "runtime loads {name} but it is missing");
+    }
+}

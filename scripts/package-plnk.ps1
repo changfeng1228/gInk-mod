@@ -176,8 +176,8 @@ foreach ($relative in $requiredFiles) {
 
 Compress-Archive -LiteralPath $package -DestinationPath $zip -CompressionLevel Optimal
 $assetCount = (Get-ChildItem -LiteralPath (Join-Path $package 'assets\icons') -File).Count
-if ($assetCount -ne 34) {
-    throw "Unexpected packaged asset count: $assetCount (expected 34)"
+if ($assetCount -ne 28) {
+    throw "Unexpected packaged asset count: $assetCount (expected 28)"
 }
 
 # Keep the Startup (autostart) shortcut on the newest package automatically;
