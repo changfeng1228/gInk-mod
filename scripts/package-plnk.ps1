@@ -1,13 +1,49 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$Version = '0.1.0',
+    [string]$Version = '',
     [string]$Destination = [Environment]::GetFolderPath('Desktop')
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-PlnkManifestVersion([string]$ManifestPath) {
+    $text = [IO.File]::ReadAllText($ManifestPath)
+    $packageMatch = [regex]::Match($text, '(?m)^\[package\]\s*$')
+    if (-not $packageMatch.Success) {
+        throw "Could not find a [package] section in $ManifestPath"
+    }
+    $start = $packageMatch.Index + $packageMatch.Length
+    $nextSection = [regex]::Match($text.Substring($start), '(?m)^\[')
+    $length = if ($nextSection.Success) { $nextSection.Index } else { $text.Length - $start }
+    $versionMatch = [regex]::Match($text.Substring($start, $length), '(?m)^\s*version\s*=\s*"([^"]+)"')
+    if (-not $versionMatch.Success) {
+        throw "Could not find the [package] version in $ManifestPath"
+    }
+    return $versionMatch.Groups[1].Value
+}
+
 $repo = Split-Path -Parent $PSScriptRoot
+$manifest = Join-Path $repo 'plnk\Cargo.toml'
+if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+    throw "Cargo manifest is missing: $manifest"
+}
+if ([string]::IsNullOrWhiteSpace($Version)) {
+    $Version = Get-PlnkManifestVersion $manifest
+}
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Invalid version '$Version'; expected x.y.z (for example 0.1.1)."
+}
+
+$commit = 'unknown'
+$git = Get-Command git -ErrorAction SilentlyContinue
+if ($null -ne $git) {
+    $head = & git -C $repo rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $head) {
+        $commit = ($head | Select-Object -First 1).Trim()
+    }
+}
+
 $exe = Join-Path $repo "plnk\target\release\plnk.exe"
 $assets = Join-Path $repo "plnk\assets\icons"
 $license = Join-Path $repo 'license.txt'
@@ -74,6 +110,7 @@ $versionText = @"
 plnk $Version
 Windows 64-bit portable
 FileVersion=$expectedFileVersion
+Commit=$commit
 Built from the gInk MIT-licensed asset set (Weizhi Nai).
 "@
 [IO.File]::WriteAllText((Join-Path $package 'VERSION'), $versionText + [Environment]::NewLine, $utf8)
@@ -93,7 +130,7 @@ plnk $Version（Windows 64 位便携版）
    也可组合：plnk.exe --no-hotkeys --pen-width
 
 当前版本
-- 版本号 0.1.0；exe 已嵌入 FileVersion/ProductVersion 0.1.0.0 和原版红色图标。
+- 版本号 $Version；exe 已嵌入 FileVersion/ProductVersion $expectedFileVersion 和原版红色图标。
 - 工具栏使用原版 gInk PNG 位图，托盘使用 icon_red.ico；White_Tray_Icon=True 时使用 icon_white.ico。
 - 笔宽面板使用原版 penwidthpanel.png；无需安装，不修改启动项。
 - 资源位于 exe 旁的 assets\icons。缺少资源时记录警告并回退，不会因此崩溃。
@@ -129,6 +166,7 @@ if ($assetCount -ne 29) {
     Package = $package
     Zip = $zip
     Version = (Get-Item -LiteralPath (Join-Path $package 'plnk.exe')).VersionInfo.FileVersion
+    Commit = $commit
     Assets = $assetCount
     ExeSHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $package 'plnk.exe')).Hash
     ZipSHA256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash

@@ -1,12 +1,42 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$Package = (Join-Path ([Environment]::GetFolderPath('Desktop')) 'plnk-v0.1.0-win64'),
+    [string]$Package = '',
     [string]$EvidenceDirectory = (Join-Path $env:TEMP 'plnk-package-evidence')
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+
+$repo = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($Package)) {
+    $manifest = Join-Path $repo 'plnk\Cargo.toml'
+    $manifestText = [IO.File]::ReadAllText($manifest)
+    $packageSection = [regex]::Match($manifestText, '(?ms)^\[package\]\s*$.*?(?=^\[|\z)')
+    $manifestVersion = [regex]::Match($packageSection.Value, '(?m)^\s*version\s*=\s*"([^"]+)"')
+    if (-not $packageSection.Success -or -not $manifestVersion.Success) {
+        throw "Could not read the [package] version from $manifest"
+    }
+    $Package = Join-Path ([Environment]::GetFolderPath('Desktop')) "plnk-v$($manifestVersion.Groups[1].Value)-win64"
+}
+$Package = (Resolve-Path -LiteralPath $Package).Path
+
+$versionFile = Join-Path $Package 'VERSION'
+if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+    throw "Package VERSION file missing: $versionFile"
+}
+$versionText = [IO.File]::ReadAllText($versionFile)
+$versionMatch = [regex]::Match($versionText, '(?m)^plnk (\d+\.\d+\.\d+)\s*$')
+if (-not $versionMatch.Success) {
+    throw "Package VERSION does not start with 'plnk x.y.z': $versionFile"
+}
+$Version = $versionMatch.Groups[1].Value
+if ($versionText -notmatch '(?m)^Commit=\S+\s*$') {
+    throw "Package VERSION has no Commit= line; it cannot be traced to a Git commit: $versionFile"
+}
+if ($versionText -match '(?m)^Commit=unknown\s*$') {
+    Write-Warning 'Package VERSION records Commit=unknown; Git traceability is not proven.'
+}
 
 Add-Type -TypeDefinition @'
 using System;
@@ -281,7 +311,7 @@ try {
     }
     finally { $stream.Dispose() }
     foreach ($expected in @(
-        'plnk 0.1.0 starting', 'tray icon added (legacy icon_red.ico ICO)',
+        "plnk $Version starting", 'tray icon added (legacy icon_red.ico ICO)',
         'original toolbar bitmaps loaded: 19/19', 'original pen-width panel bitmap loaded: true',
         'ink committed: 1 document strokes', 'global pen width:', 'leaving annotation: Escape',
         'exit requested: tray menu Exit', 'shutdown complete', 'plnk exited normally'

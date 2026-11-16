@@ -517,7 +517,10 @@ fn assets_resolve_next_to_the_executable_and_select_tray_colour() {
     );
     assert_eq!(tray_icon_filename(false), "icon_red.ico");
     assert_eq!(tray_icon_filename(true), "icon_white.ico");
-    assert_eq!(plnk::tray::TRAY_TOOLTIP, "plnk 0.1.0");
+    assert_eq!(
+        plnk::tray::TRAY_TOOLTIP,
+        concat!("plnk ", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[test]
