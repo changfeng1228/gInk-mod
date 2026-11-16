@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::process::ExitCode;
 
 use plnk::app::{App, AppError, INSTANCE_MUTEX_NAME, InstanceGuard, RunOptions};
