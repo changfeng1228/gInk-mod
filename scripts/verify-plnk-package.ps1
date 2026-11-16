@@ -1,4 +1,4 @@
-﻿# Verifies a packaged plnk build. By default it verifies the package matching
+# Verifies a packaged plnk build. By default it verifies the package matching
 # the current plnk/Cargo.toml version under <repo>\release. Use -Package to
 # point at an explicit package folder, or -Version/-Destination to resolve
 # <Destination>\plnk-v<Version>-win64 (Destination defaults to <repo>\release).
@@ -311,6 +311,11 @@ try {
     }
     Start-Sleep -Milliseconds 500
     Capture-PlnkRegion ([Math]::Max(0, $menuX - 100)) ([Math]::Max(0, $menuY - 100)) 500 400 $trayMenuShot
+    # The tray menu holds "Options...", a separator, then "Exit". TrackPopupMenu
+    # starts with no item selected, so a single Up lands on the last item (Exit)
+    # only if the menu wraps. Sending Up twice is unambiguous: the separator is
+    # skipped and Exit is the last selectable entry either way.
+    Invoke-PlnkKey 0x28
     Invoke-PlnkKey 0x28
     Invoke-PlnkKey 0x0D
     if (-not $process.HasExited) { Wait-Process -Id $process.Id -Timeout 10 -ErrorAction Stop }
